@@ -58,6 +58,28 @@ if stop_owned_gateway >/dev/null 2>&1; then
 fi
 unset LISTENER_PID
 
+# A started Gateway must own a separate session so it survives the shell that
+# invoked `csswitch-codex start` (including SSH and headless command runners).
+lifecycle_gateway="$FIXTURE/lifecycle-gateway"
+printf '#!/usr/bin/env bash\nwhile :; do sleep 1; done\n' >"$lifecycle_gateway"
+chmod 0755 "$lifecycle_gateway"
+gateway_bin="$lifecycle_gateway"
+gateway_log="$CSSWITCH_HEADLESS_DIR/lifecycle-gateway.log"
+gateway_pid_file="$CSSWITCH_HEADLESS_DIR/lifecycle-gateway.pid"
+start_gateway
+lifecycle_pid="$(<"$gateway_pid_file")"
+lifecycle_sid="$(ps -o sid= -p "$lifecycle_pid" | tr -d ' ')"
+[ "$lifecycle_sid" = "$lifecycle_pid" ] || {
+  kill -TERM "$lifecycle_pid" 2>/dev/null || true
+  fail "Gateway was not detached into its own session"
+}
+kill -TERM "$lifecycle_pid"
+wait "$lifecycle_pid" 2>/dev/null || true
+gateway_bin="$CSSWITCH_GATEWAY_BIN"
+gateway_log="$CSSWITCH_HEADLESS_DIR/gateway.log"
+gateway_pid_file="$CSSWITCH_HEADLESS_DIR/gateway.pid"
+gateway_started=0
+
 events="$FIXTURE/events"
 : >"$events"
 ensure_private_state() { echo state >>"$events"; }

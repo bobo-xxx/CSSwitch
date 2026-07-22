@@ -5,6 +5,8 @@ gateway_bin=${CSSWITCH_GATEWAY_BIN:-/home/bio-13/.local/bin/csswitch-gateway}
 science_bin=${CSSWITCH_SCIENCE_BIN:-/home/bio-13/.local/bin/claude-science}
 curl_bin=${CSSWITCH_CURL_BIN:-/usr/bin/curl}
 ss_bin=${CSSWITCH_SS_BIN:-/usr/bin/ss}
+setsid_bin=${CSSWITCH_SETSID_BIN:-/usr/bin/setsid}
+nohup_bin=${CSSWITCH_NOHUP_BIN:-/usr/bin/nohup}
 state_dir=${CSSWITCH_HEADLESS_DIR:-"${HOME:?}/.csswitch/headless"}
 science_data=${CSSWITCH_SCIENCE_DATA_DIR:-/work/run/projects/bio-13/.claude-science}
 proc_root=${CSSWITCH_PROC_ROOT:-/proc}
@@ -65,6 +67,8 @@ require_runtime_inputs() {
   [ -d "$science_data" ] || { die "Science data directory is unavailable"; return 1; }
   [ -x "$curl_bin" ] || { die "curl is unavailable"; return 1; }
   [ -x "$ss_bin" ] || { die "ss is unavailable"; return 1; }
+  [ -x "$setsid_bin" ] || { die "setsid is unavailable"; return 1; }
+  [ -x "$nohup_bin" ] || { die "nohup is unavailable"; return 1; }
 }
 
 require_auth_ready() {
@@ -155,7 +159,8 @@ start_gateway() {
   : >"$gateway_log"
   chmod 600 "$gateway_log"
   CSSWITCH_AUTH_TOKEN="$CSSWITCH_AUTH_TOKEN" \
-    "$gateway_bin" --provider codex --port "$gateway_port" >>"$gateway_log" 2>&1 &
+    "$nohup_bin" "$setsid_bin" "$gateway_bin" --provider codex --port "$gateway_port" \
+      </dev/null >>"$gateway_log" 2>&1 &
   local pid=$!
   write_pid_file "$gateway_pid_file" "$pid"
   gateway_started=1
