@@ -134,7 +134,7 @@ pub fn run_cli(args: &[String]) -> CliRun {
         );
     };
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         return oauth_error_run(
             command,
@@ -142,7 +142,7 @@ pub fn run_cli(args: &[String]) -> CliRun {
         );
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     {
         let state_root = match production_state_root() {
             Ok(root) => root,
@@ -171,13 +171,18 @@ pub fn run_cli(args: &[String]) -> CliRun {
     }
 }
 
-#[cfg(target_os = "macos")]
-fn production_state_root() -> Result<PathBuf, StorageError> {
-    let home = std::env::var_os("HOME")
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn production_state_root_from(home: Option<std::ffi::OsString>) -> Result<PathBuf, StorageError> {
+    let home = home
         .map(PathBuf::from)
         .filter(|path| path.is_absolute())
         .ok_or_else(|| StorageError::InvalidState("HOME is unavailable or not absolute".into()))?;
     Ok(super::state_root_from_home(&home))
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn production_state_root() -> Result<PathBuf, StorageError> {
+    production_state_root_from(std::env::var_os("HOME"))
 }
 
 fn run_cli_with(
@@ -584,6 +589,17 @@ mod tests {
     use super::super::AuthStatusReason;
     use super::*;
     use serde_json::Value;
+    use std::ffi::OsString;
+
+    #[test]
+    fn production_state_root_requires_absolute_home() {
+        assert!(production_state_root_from(None).is_err());
+        assert!(production_state_root_from(Some(OsString::from("relative"))).is_err());
+        assert_eq!(
+            production_state_root_from(Some(OsString::from("/srv/user"))).unwrap(),
+            PathBuf::from("/srv/user").join(super::super::CODEX_STATE_DIR_NAME)
+        );
+    }
 
     #[test]
     fn legacy_device_login_command_is_rejected_before_any_auth_work() {
