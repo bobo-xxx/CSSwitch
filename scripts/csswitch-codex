@@ -1,0 +1,342 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+gateway_bin=${CSSWITCH_GATEWAY_BIN:-/home/bio-13/.local/bin/csswitch-gateway}
+science_bin=${CSSWITCH_SCIENCE_BIN:-/home/bio-13/.local/bin/claude-science}
+curl_bin=${CSSWITCH_CURL_BIN:-/usr/bin/curl}
+ss_bin=${CSSWITCH_SS_BIN:-/usr/bin/ss}
+state_dir=${CSSWITCH_HEADLESS_DIR:-"${HOME:?}/.csswitch/headless"}
+science_data=${CSSWITCH_SCIENCE_DATA_DIR:-/work/run/projects/bio-13/.claude-science}
+proc_root=${CSSWITCH_PROC_ROOT:-/proc}
+gateway_port=${CSSWITCH_GATEWAY_PORT:-11434}
+science_port=${CSSWITCH_SCIENCE_PORT:-9002}
+sandbox_port=${CSSWITCH_SANDBOX_PORT:-9003}
+runtime_env="$state_dir/runtime.env"
+gateway_pid_file="$state_dir/gateway.pid"
+science_pid_file="$state_dir/science.pid"
+gateway_log="$state_dir/gateway.log"
+science_log="$state_dir/science.log"
+gateway_started=0
+CSSWITCH_AUTH_TOKEN=${CSSWITCH_AUTH_TOKEN:-}
+
+die() { echo "csswitch-codex: $*" >&2; return 1; }
+
+reject_symlink() {
+  [ ! -L "$1" ] || { die "refusing symlink: $1"; return 1; }
+}
+
+ensure_private_state() {
+  umask 077
+  reject_symlink "$state_dir"
+  mkdir -p "$state_dir"
+  [ -d "$state_dir" ] || { die "runtime state is not a directory"; return 1; }
+  chmod 700 "$state_dir"
+}
+
+load_or_create_secret() {
+  local secret tmp
+  reject_symlink "$runtime_env"
+  if [ ! -e "$runtime_env" ]; then
+    secret="$(od -An -N32 -tx1 /dev/urandom | tr -d ' \n')"
+    [[ "$secret" =~ ^[0-9a-f]{64}$ ]] || { die "random secret generation failed"; return 1; }
+    tmp="$runtime_env.$$"
+    reject_symlink "$tmp"
+    printf 'CSSWITCH_AUTH_TOKEN=%s\n' "$secret" >"$tmp"
+    chmod 600 "$tmp"
+    mv "$tmp" "$runtime_env"
+  fi
+  load_secret
+}
+
+load_secret() {
+  local secret
+  reject_symlink "$runtime_env"
+  [ -f "$runtime_env" ] || { die "runtime environment is not a regular file"; return 1; }
+  [ "$(stat -c %a "$runtime_env")" = 600 ] || { die "runtime environment mode must be 0600"; return 1; }
+  IFS= read -r secret <"$runtime_env" || { die "runtime environment is unreadable"; return 1; }
+  [[ "$secret" =~ ^CSSWITCH_AUTH_TOKEN=([0-9a-f]{64})$ ]] || { die "runtime environment is invalid"; return 1; }
+  CSSWITCH_AUTH_TOKEN=${BASH_REMATCH[1]}
+}
+
+require_runtime_inputs() {
+  [ -x "$gateway_bin" ] || { die "Gateway executable is unavailable"; return 1; }
+  [ -x "$science_bin" ] || { die "Science executable is unavailable"; return 1; }
+  reject_symlink "$science_data"
+  [ -d "$science_data" ] || { die "Science data directory is unavailable"; return 1; }
+  [ -x "$curl_bin" ] || { die "curl is unavailable"; return 1; }
+  [ -x "$ss_bin" ] || { die "ss is unavailable"; return 1; }
+}
+
+require_auth_ready() {
+  local status
+  status="$($gateway_bin codex-auth status 2>/dev/null)" || { die "Codex auth status is unavailable"; return 1; }
+  [[ "$status" == *'"ok":true'* && "$status" == *'"authenticated":true'* ]] || \
+    die "Codex authentication is required"
+}
+
+listener_pid() {
+  local port="$1" output pids count
+  output="$($ss_bin -H -ltnp "sport = :$port" 2>/dev/null)" || { die "listener inspection failed for port $port"; return 1; }
+  [ -n "$output" ] || return 0
+  pids="$(printf '%s\n' "$output" | sed -n 's/.*pid=\([0-9][0-9]*\).*/\1/p' | sort -u)"
+  [ -n "$pids" ] || { die "listener owner is hidden for port $port"; return 1; }
+  count="$(printf '%s\n' "$pids" | wc -l | tr -d ' ')"
+  [ "$count" = 1 ] || { die "multiple listener owners found for port $port"; return 1; }
+  printf '%s\n' "$pids"
+}
+
+read_pid_file() {
+  local path="$1" pid
+  reject_symlink "$path"
+  [ -f "$path" ] || return 1
+  [ "$(stat -c %a "$path")" = 600 ] || { die "PID record mode must be 0600"; return 1; }
+  IFS= read -r pid <"$path" || { die "PID record is unreadable"; return 1; }
+  [[ "$pid" =~ ^[1-9][0-9]*$ ]] || { die "PID record is invalid"; return 1; }
+  printf '%s\n' "$pid"
+}
+
+write_pid_file() {
+  local path="$1" pid="$2" tmp="$1.$$"
+  reject_symlink "$path"
+  reject_symlink "$tmp"
+  printf '%s\n' "$pid" >"$tmp"
+  chmod 600 "$tmp"
+  mv "$tmp" "$path"
+}
+
+verify_process_identity() {
+  local kind="$1" pid="$2" port="$3" expected_bin expected_arg uid exe owner cmd
+  case "$kind" in
+    gateway) expected_bin="$gateway_bin"; expected_arg="codex" ;;
+    science) expected_bin="$science_bin"; expected_arg="$science_data" ;;
+    *) die "unknown process kind" ;;
+  esac
+  [ -r "$proc_root/$pid/status" ] && [ -r "$proc_root/$pid/cmdline" ] && \
+    [ -e "$proc_root/$pid/exe" ] || { die "$kind PID is not alive"; return 1; }
+  uid="$(id -u)"
+  owner="$(awk '/^Uid:/{print $2; exit}' "$proc_root/$pid/status")"
+  [ "$owner" = "$uid" ] || { die "$kind PID belongs to another user"; return 1; }
+  exe="$(readlink -f "$proc_root/$pid/exe")"
+  [ "$exe" = "$(readlink -f "$expected_bin")" ] || { die "$kind executable does not match"; return 1; }
+  cmd="$(tr '\0' '\n' <"$proc_root/$pid/cmdline")"
+  grep -Fxq -- "$expected_arg" <<<"$cmd" || { die "$kind command identity does not match"; return 1; }
+  grep -Fxq -- "$port" <<<"$cmd" || { die "$kind port identity does not match"; return 1; }
+}
+
+verify_process() {
+  local kind="$1" pid="$2" port="$3" listener
+  verify_process_identity "$kind" "$pid" "$port"
+  listener="$(listener_pid "$port")" || return 1
+  [ "$listener" = "$pid" ] || { die "$kind does not own port $port"; return 1; }
+}
+
+assert_port_available() {
+  local kind="$1" port="$2" pid_file="$3" listener recorded
+  listener="$(listener_pid "$port")" || return 1
+  [ -z "$listener" ] && return 0
+  recorded="$(read_pid_file "$pid_file")" || { die "port $port has an unknown owner"; return 1; }
+  [ "$recorded" = "$listener" ] || { die "port $port owner differs from its PID record"; return 1; }
+  verify_process "$kind" "$recorded" "$port"
+  die "owned $kind is already running"
+}
+
+assert_start_ports_available() {
+  assert_port_available gateway "$gateway_port" "$gateway_pid_file"
+  local listener recorded
+  listener="$(listener_pid "$science_port")" || return 1
+  if [ -n "$listener" ]; then
+    recorded="$(read_pid_file "$science_pid_file")" || { die "Science port has an unknown owner"; return 1; }
+    [ "$recorded" = "$listener" ] || { die "Science port owner differs from its PID record"; return 1; }
+    verify_process science "$recorded" "$science_port"
+  fi
+}
+
+start_gateway() {
+  : >"$gateway_log"
+  chmod 600 "$gateway_log"
+  CSSWITCH_AUTH_TOKEN="$CSSWITCH_AUTH_TOKEN" \
+    "$gateway_bin" --provider codex --port "$gateway_port" >>"$gateway_log" 2>&1 &
+  local pid=$!
+  write_pid_file "$gateway_pid_file" "$pid"
+  gateway_started=1
+}
+
+wait_gateway_health() {
+  local attempt
+  for attempt in $(seq 1 50); do
+    if "$curl_bin" --silent --show-error --fail --max-time 2 \
+      "http://127.0.0.1:$gateway_port/$CSSWITCH_AUTH_TOKEN/health" >/dev/null 2>&1; then
+      local pid
+      pid="$(read_pid_file "$gateway_pid_file")" || return 1
+      verify_process gateway "$pid" "$gateway_port"
+      return 0
+    fi
+    sleep 0.1
+  done
+  die "Gateway health check failed"
+}
+
+require_dynamic_catalog() {
+  local tmp="$state_dir/models.$$"
+  reject_symlink "$tmp"
+  : >"$tmp"
+  chmod 600 "$tmp"
+  if ! "$curl_bin" --silent --show-error --fail --max-time 15 \
+    "http://127.0.0.1:$gateway_port/$CSSWITCH_AUTH_TOKEN/v1/models" >"$tmp"; then
+    rm -f "$tmp"
+    die "Codex model discovery failed"
+  fi
+  if ! grep -q '"data"' "$tmp" || ! grep -q 'Codex / ' "$tmp"; then
+    rm -f "$tmp"
+    die "no compatible Codex model was discovered"
+  fi
+  rm -f "$tmp"
+}
+
+wait_for_exit() {
+  local pid="$1" attempt
+  for attempt in $(seq 1 100); do
+    [ ! -e "$proc_root/$pid/status" ] && return 0
+    sleep 0.1
+  done
+  return 1
+}
+
+stop_verified() {
+  local kind="$1" port="$2" pid_file="$3" pid listener
+  if ! pid="$(read_pid_file "$pid_file")"; then
+    listener="$(listener_pid "$port")" || return 1
+    if [ -n "$listener" ]; then
+      die "$kind port has an unknown owner"
+      return 1
+    fi
+    return 0
+  fi
+  verify_process_identity "$kind" "$pid" "$port" || return 1
+  listener="$(listener_pid "$port")" || return 1
+  [ -z "$listener" ] || [ "$listener" = "$pid" ] || { die "$kind port belongs to another PID"; return 1; }
+  kill -TERM "$pid"
+  if ! wait_for_exit "$pid"; then
+    verify_process_identity "$kind" "$pid" "$port" || return 1
+    kill -KILL "$pid"
+    wait_for_exit "$pid" || { die "$kind did not stop"; return 1; }
+  fi
+  rm -f "$pid_file"
+}
+
+stop_owned_gateway() {
+  stop_verified gateway "$gateway_port" "$gateway_pid_file" || return 1
+  gateway_started=0
+}
+
+stop_owned_science() {
+  stop_verified science "$science_port" "$science_pid_file" || return 1
+}
+
+science_status_json() {
+  "$science_bin" status --data-dir "$science_data" 2>/dev/null
+}
+
+replace_science() {
+  local listener status pid attempt
+  listener="$(listener_pid "$science_port")" || return 1
+  if [ -n "$listener" ]; then
+    stop_owned_science
+  fi
+  : >"$science_log"
+  chmod 600 "$science_log"
+  ANTHROPIC_BASE_URL="http://127.0.0.1:$gateway_port/$CSSWITCH_AUTH_TOKEN" \
+  HTTPS_PROXY="http://127.0.0.1:$gateway_port" \
+  https_proxy="http://127.0.0.1:$gateway_port" \
+  HTTP_PROXY="${HTTP_PROXY:-}" http_proxy="${http_proxy:-}" \
+  NO_PROXY="127.0.0.1,localhost" no_proxy="127.0.0.1,localhost" \
+    "$science_bin" serve --data-dir "$science_data" --host 127.0.0.1 \
+      --port "$science_port" --sandbox-port "$sandbox_port" --no-browser \
+      --no-auto-update --detached >>"$science_log" 2>&1
+  for attempt in $(seq 1 50); do
+    status="$(science_status_json)" || status=''
+    if [[ "$status" == *'"running": true'* || "$status" == *'"running":true'* ]]; then
+      pid="$(printf '%s\n' "$status" | sed -n 's/.*"pid"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -1)"
+      [ -n "$pid" ] || { die "Science status omitted its PID"; return 1; }
+      verify_process science "$pid" "$science_port" || return 1
+      write_pid_file "$science_pid_file" "$pid"
+      return 0
+    fi
+    sleep 0.1
+  done
+  die "Science did not become ready"
+}
+
+start_runtime() {
+  ensure_private_state
+  load_or_create_secret
+  require_runtime_inputs
+  require_auth_ready
+  assert_start_ports_available
+  start_gateway
+  if ! wait_gateway_health || ! require_dynamic_catalog || ! replace_science; then
+    if [ "$gateway_started" = 1 ]; then stop_owned_gateway || true; fi
+    return 1
+  fi
+  echo "Codex Gateway and Claude Science are running"
+}
+
+auth_status_line() {
+  if require_auth_ready >/dev/null 2>&1; then echo "auth=ready"; else echo "auth=missing"; fi
+}
+
+gateway_status_line() {
+  local pid health=unavailable catalog=unavailable
+  if pid="$(read_pid_file "$gateway_pid_file" 2>/dev/null)" && \
+     verify_process gateway "$pid" "$gateway_port" >/dev/null 2>&1; then
+    if "$curl_bin" --silent --fail --max-time 2 \
+      "http://127.0.0.1:$gateway_port/$CSSWITCH_AUTH_TOKEN/health" >/dev/null 2>&1; then
+      health=ready
+    fi
+    if "$curl_bin" --silent --fail --max-time 5 \
+      "http://127.0.0.1:$gateway_port/$CSSWITCH_AUTH_TOKEN/v1/models" 2>/dev/null | grep -q 'Codex / '; then
+      catalog=ready
+    fi
+    echo "gateway=running health=$health catalog=$catalog"
+  else
+    echo "gateway=stopped health=unavailable catalog=unavailable"
+  fi
+}
+
+science_status_line() {
+  local pid
+  if pid="$(read_pid_file "$science_pid_file" 2>/dev/null)" && \
+     verify_process science "$pid" "$science_port" >/dev/null 2>&1; then
+    echo "science=running listener=ready"
+  else
+    echo "science=stopped listener=absent"
+  fi
+}
+
+status_runtime() {
+  ensure_private_state
+  if [ -e "$runtime_env" ]; then load_secret; else CSSWITCH_AUTH_TOKEN=''; fi
+  auth_status_line
+  gateway_status_line
+  science_status_line
+}
+
+stop_runtime() {
+  ensure_private_state
+  stop_owned_science
+  stop_owned_gateway
+  echo "Owned Codex runtime stopped"
+}
+
+main() {
+  case "${1:-}" in
+    start) start_runtime ;;
+    stop) stop_runtime ;;
+    status) status_runtime ;;
+    *) die "usage: csswitch-codex start|stop|status" ;;
+  esac
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi
