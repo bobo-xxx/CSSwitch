@@ -1,20 +1,27 @@
-use std::io::{BufRead, Read, Write};
+use std::io::Write;
+#[cfg(target_os = "macos")]
+use std::io::{BufRead, Read};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use serde::{Deserialize, Serialize};
+#[cfg(any(target_os = "macos", test))]
+use serde::Deserialize;
+use serde::Serialize;
 
 use super::storage::StorageError;
 use super::{
-    production_status, run_production_login_async, run_production_logout,
-    run_production_logout_local, AuthStatus, LoginControl, LoginProgress, OAuthErrorCode,
-    OAuthFlowError,
+    production_status, run_production_login_headless, run_production_logout,
+    run_production_logout_local, AuthStatus, LoginControl, OAuthErrorCode, OAuthFlowError,
 };
+#[cfg(target_os = "macos")]
+use super::{run_production_login_async, LoginProgress};
 
 const CLI_SCHEMA_VERSION: u32 = 3;
 const EXPIRING_WINDOW_SECONDS: i64 = 5 * 60;
+#[cfg(target_os = "macos")]
 const MAX_NDJSON_LINE_BYTES: usize = 8 * 1024;
+#[cfg(target_os = "macos")]
 const MAX_NDJSON_TOTAL_BYTES: usize = 64 * 1024;
 const OPERATION_ID_ENV: &str = "CSSWITCH_CODEX_AUTH_OPERATION_ID";
 
@@ -22,6 +29,71 @@ const OPERATION_ID_ENV: &str = "CSSWITCH_CODEX_AUTH_OPERATION_ID";
 pub struct CliRun {
     pub json: String,
     pub exit_code: i32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct HeadlessArgs {
+    callback_port: u16,
+}
+
+fn parse_headless_args(args: &[String]) -> Result<HeadlessArgs, ()> {
+    match args {
+        [command, port_flag, port, show_url]
+            if command == "login-headless"
+                && port_flag == "--callback-port"
+                && show_url == "--show-url" =>
+        {
+            match port.parse::<u16>() {
+                Ok(callback_port @ (1455 | 1457)) => Ok(HeadlessArgs { callback_port }),
+                _ => Err(()),
+            }
+        }
+        _ => Err(()),
+    }
+}
+
+#[derive(Clone)]
+struct AuthorizationUrlWriter<W> {
+    inner: Arc<Mutex<W>>,
+    emitted: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl<W> AuthorizationUrlWriter<W>
+where
+    W: Write,
+{
+    fn new(inner: Arc<Mutex<W>>) -> Self {
+        Self {
+            inner,
+            emitted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+
+    fn show(&self, url: &str) -> Result<(), OAuthFlowError> {
+        self.emitted
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .map_err(|_| authorization_url_output_error())?;
+        let mut output = self
+            .inner
+            .lock()
+            .map_err(|_| authorization_url_output_error())?;
+        writeln!(output, "{url}").map_err(|_| authorization_url_output_error())?;
+        output.flush().map_err(|_| authorization_url_output_error())
+    }
+}
+
+fn authorization_url_output_error() -> OAuthFlowError {
+    OAuthFlowError::new(
+        OAuthErrorCode::BrowserOpenFailed,
+        false,
+        "The authorization URL could not be written",
+    )
+    .at_stage("browser_open")
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -128,7 +200,7 @@ pub fn run_cli(args: &[String]) -> CliRun {
         return error_run(
             None,
             "invalid_arguments",
-            "Usage: csswitch-gateway codex-auth login-browser|status|logout",
+            "Usage: csswitch-gateway codex-auth login-browser|login-headless|status|logout",
             false,
             2,
         );
@@ -168,6 +240,89 @@ pub fn run_cli(args: &[String]) -> CliRun {
                 reason: "proxy_config_invalid",
             }),
         )
+    }
+}
+
+pub fn run_headless_cli(args: &[String]) -> Option<CliRun> {
+    if args.first().map(String::as_str) != Some("login-headless") {
+        return None;
+    }
+    let parsed = match parse_headless_args(args) {
+        Ok(parsed) => parsed,
+        Err(()) => {
+            return Some(error_run(
+                Some("login-headless"),
+                "invalid_arguments",
+                "Usage: csswitch-gateway codex-auth login-headless --callback-port 1455|1457 --show-url",
+                false,
+                2,
+            ));
+        }
+    };
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = parsed;
+        return Some(oauth_error_run_for(
+            "login-headless",
+            OAuthFlowError::from(StorageError::UnsupportedPlatform),
+        ));
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        let state_root = match production_state_root() {
+            Ok(root) => root,
+            Err(error) => {
+                return Some(oauth_error_run_for("login-headless", error.into()));
+            }
+        };
+        let runtime = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(runtime) => runtime,
+            Err(_) => {
+                return Some(error_run(
+                    Some("login-headless"),
+                    "internal_error",
+                    "The headless OAuth runtime could not be created",
+                    false,
+                    8,
+                ));
+            }
+        };
+        let control = LoginControl::default();
+        let stderr = AuthorizationUrlWriter::new(Arc::new(Mutex::new(std::io::stderr())));
+        let result = runtime.block_on(async {
+            let login = run_production_login_headless(
+                state_root,
+                parsed.callback_port,
+                &control,
+                |_| {},
+                move |url| stderr.show(url),
+            );
+            tokio::pin!(login);
+            tokio::select! {
+                result = &mut login => result,
+                signal = tokio::signal::ctrl_c() => {
+                    if signal.is_err() {
+                        Err(OAuthFlowError::new(
+                            OAuthErrorCode::OAuthNetwork,
+                            false,
+                            "The interrupt handler could not be installed",
+                        ).at_stage("callback_wait"))
+                    } else {
+                        let _ = control.cancel();
+                        login.await
+                    }
+                }
+            }
+        });
+        Some(match result {
+            Ok(status) => headless_success_run(&status),
+            Err(error) => oauth_error_run_for("login-headless", error),
+        })
     }
 }
 
@@ -237,11 +392,28 @@ fn success_run(
     serialize_or_internal(&envelope)
 }
 
+fn headless_success_run(status: &AuthStatus) -> CliRun {
+    let mut view = status_view(now_seconds(), status);
+    view.account_hash = None;
+    let envelope = SuccessEnvelope {
+        schema_version: CLI_SCHEMA_VERSION,
+        ok: true,
+        command: "login-headless",
+        status: view,
+        warning: None,
+    };
+    serialize_or_internal(&envelope)
+}
+
 fn oauth_error_run(command: Command, error: OAuthFlowError) -> CliRun {
+    oauth_error_run_for(command.as_str(), error)
+}
+
+fn oauth_error_run_for(command: &'static str, error: OAuthFlowError) -> CliRun {
     let envelope = ErrorEnvelope {
         schema_version: CLI_SCHEMA_VERSION,
         ok: false,
-        command: Some(command.as_str()),
+        command: Some(command),
         error: ErrorView {
             code: error.code.as_str(),
             message: error.message,
@@ -304,6 +476,7 @@ fn internal_serialization_error() -> CliRun {
     }
 }
 
+#[cfg(target_os = "macos")]
 #[derive(Serialize)]
 struct StreamingEvent<'a> {
     schema_version: u32,
@@ -319,6 +492,7 @@ struct StreamingEvent<'a> {
     error: Option<StreamingError<'a>>,
 }
 
+#[cfg(target_os = "macos")]
 #[derive(Serialize)]
 struct StreamingError<'a> {
     code: &'a str,
@@ -334,6 +508,7 @@ struct StreamingError<'a> {
     transport_kind: Option<&'a str>,
 }
 
+#[cfg(any(target_os = "macos", test))]
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CancelInput {
@@ -342,6 +517,7 @@ struct CancelInput {
     command: String,
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn valid_cancel_input(line: &[u8], operation_id: &str) -> bool {
     serde_json::from_slice::<CancelInput>(line).is_ok_and(|cancel| {
         cancel.schema_version == CLI_SCHEMA_VERSION
@@ -350,17 +526,20 @@ fn valid_cancel_input(line: &[u8], operation_id: &str) -> bool {
     })
 }
 
+#[cfg(target_os = "macos")]
 #[derive(Clone)]
 struct NdjsonWriter {
     inner: Arc<Mutex<NdjsonWriterInner>>,
 }
 
+#[cfg(target_os = "macos")]
 struct NdjsonWriterInner {
     output: std::io::Stdout,
     total: usize,
     failed: bool,
 }
 
+#[cfg(target_os = "macos")]
 impl NdjsonWriter {
     fn stdout() -> Self {
         Self {
@@ -407,7 +586,7 @@ pub fn run_streaming_cli(args: &[String]) -> Option<i32> {
     #[cfg(not(target_os = "macos"))]
     {
         let _ = operation_id;
-        return Some(6);
+        Some(6)
     }
     #[cfg(target_os = "macos")]
     {
@@ -479,6 +658,7 @@ pub fn run_streaming_cli(args: &[String]) -> Option<i32> {
     }
 }
 
+#[cfg(target_os = "macos")]
 fn progress_event<'a>(operation_id: &'a str, state: &'a str) -> StreamingEvent<'a> {
     StreamingEvent {
         schema_version: CLI_SCHEMA_VERSION,
@@ -491,6 +671,7 @@ fn progress_event<'a>(operation_id: &'a str, state: &'a str) -> StreamingEvent<'
     }
 }
 
+#[cfg(target_os = "macos")]
 fn streaming_error(error: &OAuthFlowError) -> StreamingError<'_> {
     StreamingError {
         code: error.code.as_str(),
@@ -535,6 +716,7 @@ fn now_seconds() -> i64 {
         .unwrap_or(i64::MAX)
 }
 
+#[cfg(target_os = "macos")]
 fn spawn_cancel_reader(operation_id: String, control: LoginControl, writer: NdjsonWriter) {
     std::thread::spawn(move || {
         let mut input =
@@ -602,12 +784,96 @@ mod tests {
     }
 
     #[test]
+    fn headless_arguments_are_explicit_and_bounded() {
+        let invalid = [
+            vec!["login-headless"],
+            vec!["login-headless", "--show-url"],
+            vec!["login-headless", "--callback-port", "1455"],
+            vec!["login-headless", "--callback-port", "1456", "--show-url"],
+            vec![
+                "login-headless",
+                "--callback-port",
+                "1455",
+                "--show-url",
+                "extra",
+            ],
+        ];
+        for args in invalid {
+            let args = args.into_iter().map(String::from).collect::<Vec<_>>();
+            assert!(parse_headless_args(&args).is_err());
+        }
+        assert_eq!(
+            parse_headless_args(&[
+                "login-headless".into(),
+                "--callback-port".into(),
+                "1455".into(),
+                "--show-url".into(),
+            ])
+            .unwrap(),
+            HeadlessArgs {
+                callback_port: 1455
+            }
+        );
+    }
+
+    #[test]
+    fn authorization_url_writer_emits_once_to_only_its_sink() {
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let writer = AuthorizationUrlWriter::new(bytes.clone());
+        writer
+            .show("https://auth.example/authorize?state=private")
+            .unwrap();
+        assert!(writer.show("https://auth.example/second").is_err());
+        let output = String::from_utf8(bytes.lock().unwrap().clone()).unwrap();
+        assert_eq!(output.matches("https://auth.example/").count(), 1);
+        assert!(output.ends_with('\n'));
+    }
+
+    #[test]
+    fn headless_terminal_json_omits_urls_tokens_and_account_identity() {
+        let run = headless_success_run(&status(true, Some(2_000)));
+        assert_eq!(run.exit_code, 0);
+        let value: Value = serde_json::from_str(&run.json).unwrap();
+        assert_eq!(value["command"], "login-headless");
+        assert_eq!(value["status"]["authenticated"], true);
+        assert!(value["status"]["account_hash"].is_null());
+        for forbidden in [
+            "https://",
+            "state=",
+            "access_token",
+            "refresh_token",
+            "account-hash",
+        ] {
+            assert!(!run.json.contains(forbidden));
+        }
+    }
+
+    #[test]
+    fn headless_cli_routes_only_its_command_and_rejects_incomplete_consent() {
+        assert!(run_headless_cli(&["status".into()]).is_none());
+        let run = run_headless_cli(&["login-headless".into()]).unwrap();
+        assert_eq!(run.exit_code, 2);
+        let value: Value = serde_json::from_str(&run.json).unwrap();
+        assert_eq!(value["command"], "login-headless");
+        assert_eq!(value["error"]["code"], "invalid_arguments");
+        assert!(!run.json.contains("https://"));
+    }
+
+    #[test]
     fn legacy_device_login_command_is_rejected_before_any_auth_work() {
         assert_eq!(run_streaming_cli(&["login-device".into()]), Some(2));
         assert_eq!(
             run_streaming_cli(&["login-device".into(), "extra".into()]),
             Some(2)
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn browser_login_remains_rejected_on_linux() {
+        std::env::set_var(OPERATION_ID_ENV, "ab".repeat(16));
+        assert_eq!(run_streaming_cli(&["login-browser".into()]), Some(6));
+        std::env::remove_var(OPERATION_ID_ENV);
     }
 
     #[test]

@@ -6,6 +6,14 @@ fn main() {
             .map(|arg| arg.to_str().map(str::to_string))
             .collect::<Option<Vec<_>>>();
         let args = codex_args.unwrap_or_else(|| vec!["invalid".into(), "invalid".into()]);
+        if let Some(run) = csswitch_gateway::codex_auth::run_headless_cli(&args) {
+            use std::io::Write as _;
+            let _ = writeln!(std::io::stdout().lock(), "{}", run.json);
+            if run.exit_code != 0 {
+                std::process::exit(run.exit_code);
+            }
+            return;
+        }
         if let Some(exit_code) = csswitch_gateway::codex_auth::run_streaming_cli(&args) {
             if exit_code != 0 {
                 std::process::exit(exit_code);

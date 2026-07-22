@@ -5,7 +5,7 @@ mod storage;
 
 use std::path::{Path, PathBuf};
 
-pub use cli::{run_cli, run_streaming_cli, CliRun};
+pub use cli::{run_cli, run_headless_cli, run_streaming_cli, CliRun};
 pub use login_async::{CancelDisposition, LoginControl, LoginProgress};
 pub use oauth::{OAuthErrorCode, OAuthFlowError};
 pub(crate) use storage::InferenceSecrets;

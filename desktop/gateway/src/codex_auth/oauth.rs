@@ -2,6 +2,7 @@ use std::collections::HashSet;
 use std::fmt;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+#[cfg(target_os = "macos")]
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -29,6 +30,7 @@ pub const CODEX_OAUTH_ORIGINATOR: &str = "codex_cli_rs";
 const CALLBACK_PATH: &str = "/auth/callback";
 const CALLBACK_PORTS: &[u16] = &[1455, 1457];
 const LOGIN_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+#[cfg(target_os = "macos")]
 const BROWSER_OPEN_TIMEOUT: Duration = Duration::from_secs(10);
 const CALLBACK_IO_TIMEOUT: Duration = Duration::from_secs(2);
 const CALLBACK_POLL: Duration = Duration::from_millis(20);
