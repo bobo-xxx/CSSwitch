@@ -92,4 +92,14 @@ if grep -Eiq 'kimi|pkill[[:space:]]+-f|killall|watchdog|systemctl' "$CONTROLLER"
   fail "controller contains forbidden fallback or broad process control"
 fi
 
+grep -Fq 'codex-auth login-headless --callback-port 1455 --show-url' \
+  "$ROOT/docs/features/codex-science-bridge.md" || fail "headless OAuth docs are missing"
+grep -Fq 'Run this OAuth command yourself' \
+  "$ROOT/docs/features/codex-science-bridge.md" || fail "user-run OAuth warning is missing"
+grep -Fq 'claude-science url' \
+  "$ROOT/docs/features/codex-science-bridge.md" || fail "Science URL command is missing"
+if grep -Eiq 'fallback.*kimi|kimi.*fallback' "$ROOT/docs/features/codex-science-bridge.md"; then
+  fail "documentation advertises a Kimi fallback"
+fi
+
 echo "headless codex controller tests: PASS"

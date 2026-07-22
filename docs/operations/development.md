@@ -49,6 +49,24 @@ node --check desktop/src/main.js
 
 优先使用 `test/run-*.sh` 作为门禁，因为它们对缺失依赖、loopback 限制与层级状态有统一词汇；组件命令适合聚焦诊断。
 
+## Linux headless Gateway 构建与安装
+
+Linux 不构建 Tauri UI，只构建 Rust Gateway，并安装受版本控制的 controller：
+
+```bash
+cargo build --release --manifest-path desktop/gateway/Cargo.toml
+install -m 0755 desktop/gateway/target/release/csswitch-gateway ~/.local/bin/csswitch-gateway
+install -m 0755 scripts/csswitch-codex ~/.local/bin/csswitch-codex
+```
+
+OAuth 必须由用户本人在已建立的 `1455` SSH 隧道终端中执行：
+
+```bash
+~/.local/bin/csswitch-gateway codex-auth login-headless --callback-port 1455 --show-url
+```
+
+不要在自动测试、CI、agent 工具调用或证据日志中执行该命令。用户确认完成后，维护者只运行脱敏 `codex-auth status`、`csswitch-codex start|status`、动态目录检查和已单独授权的最小 live 请求。用户需要分享 Science 入口时，直接运行 `claude-science url --data-dir /work/run/projects/bio-13/.claude-science`；controller 不包装或记录该 bearer URL。
+
 ## Science 相邻功能工作法
 
 1. 在隔离环境确认上游 runtime 事实；

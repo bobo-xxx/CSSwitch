@@ -35,6 +35,34 @@ v1 明确不做：
 
 自动 Gate 已覆盖 mock OAuth、配置迁移、协议转换、动态目录、旧 UI 与生命周期；Acceptance 候选另建立了单账号浏览器 OAuth、动态目录、一个 live 模型与最小文本推理证据。两个以上 live 模型、真实工具调用、刷新/退出重登、显式代理/TUN 变体和最终公开 DMG 的 live OAuth / 推理仍未建立，不能由源码测试或旧候选外推。
 
+## Headless Linux OAuth
+
+Linux 服务器只支持 CLI 和脚本运行方式，不提供 Tauri 桌面 UI，也不会调用 `xdg-open`。先从本机建立回调隧道：
+
+```bash
+ssh -L 1455:127.0.0.1:1455 user@server
+```
+
+Run this OAuth command yourself in the SSH terminal; automation and support agents must not run it or capture its authorization URL:
+
+```bash
+csswitch-gateway codex-auth login-headless --callback-port 1455 --show-url
+```
+
+命令只绑定明确指定的 `1455`（也允许显式选择 `1457`），不会自动回落到另一端口。授权 URL 只向 stderr 写一次；完成回调后，stdout 只返回脱敏 JSON。登录本身不会启动或重启 Science。
+
+认证成功后运行：
+
+```bash
+csswitch-codex start
+csswitch-codex status
+claude-science url --data-dir /work/run/projects/bio-13/.claude-science
+```
+
+只把最后一条命令生成的 Science URL 发给可信协作者；不要分享 OAuth URL。协作者使用同一个 Science 实例，因此共享该实例可见的 workspace、工具、历史与 Codex subscription 使用权限。本适配不提供协作者账号、角色或隔离；紧急切断使用 `csswitch-codex stop`。
+
+Linux controller 只启动 Codex Gateway，并从已认证账号动态发现 `Codex / …` 模型。认证、目录或推理失败会直接失败，不切换 provider。回滚先执行 `csswitch-codex stop`，再由操作者手动选择先前备份的运行方式；controller 不包含 provider fallback。
+
 ## 参考实现边界
 
 实现语义按以下优先级取证：
