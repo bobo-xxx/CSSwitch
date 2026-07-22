@@ -131,6 +131,29 @@ impl AsyncLoginOptions {
             browser_timeout: BROWSER_TIMEOUT,
         }
     }
+
+    fn headless(callback_port: u16) -> Result<Self, OAuthFlowError> {
+        validate_headless_callback_port(callback_port)?;
+        Ok(Self {
+            issuer: CODEX_OAUTH_ISSUER.to_string(),
+            client_id: CODEX_OAUTH_CLIENT_ID.to_string(),
+            callback_ports: vec![callback_port],
+            browser_timeout: BROWSER_TIMEOUT,
+        })
+    }
+}
+
+pub(crate) fn validate_headless_callback_port(port: u16) -> Result<(), OAuthFlowError> {
+    if CALLBACK_PORTS.contains(&port) {
+        Ok(())
+    } else {
+        Err(OAuthFlowError::new(
+            OAuthErrorCode::OAuthProtocol,
+            false,
+            "The headless callback port must be 1455 or 1457",
+        )
+        .at_stage("callback_bind"))
+    }
 }
 
 pub async fn run_production_login<S, T, F>(
@@ -143,6 +166,39 @@ where
     T: StateStore,
     F: Fn(LoginProgress),
 {
+    let (client, has_proxy) = production_client()?;
+    let options = AsyncLoginOptions::production();
+    let result =
+        run_browser_login(repository, &client, has_proxy, &options, control, &progress).await;
+    control.finish();
+    result
+}
+
+pub async fn run_production_login_headless<S, T, F, U>(
+    repository: &AuthRepository<S, T>,
+    callback_port: u16,
+    control: &LoginControl,
+    progress: F,
+    show_url: U,
+) -> Result<AuthStatus, OAuthFlowError>
+where
+    S: SecretStore,
+    T: StateStore,
+    F: Fn(LoginProgress),
+    U: Fn(&str) -> Result<(), OAuthFlowError>,
+{
+    let options = AsyncLoginOptions::headless(callback_port)?;
+    let (client, has_proxy) = production_client()?;
+    let launcher = HeadlessUrlLauncher::new(show_url);
+    let result = run_browser_login_with_launcher(
+        repository, &client, has_proxy, &options, control, &progress, &launcher,
+    )
+    .await;
+    control.finish();
+    result
+}
+
+fn production_client() -> Result<(reqwest::Client, bool), OAuthFlowError> {
     let factory = CodexHttpClientFactory::from_environment().map_err(|_| {
         OAuthFlowError::new(
             OAuthErrorCode::OAuthNetwork,
@@ -174,18 +230,7 @@ where
             )
             .at_stage("proxy_config")
         })?;
-    let options = AsyncLoginOptions::production();
-    let result = run_browser_login(
-        repository,
-        &client,
-        factory.has_proxy(),
-        &options,
-        control,
-        &progress,
-    )
-    .await;
-    control.finish();
-    result
+    Ok((client, factory.has_proxy()))
 }
 
 async fn run_browser_login<S, T, F>(
@@ -230,6 +275,30 @@ impl BrowserLauncher for SystemBrowserLauncher {
         control: &'a LoginControl,
     ) -> Pin<Box<dyn Future<Output = Result<(), OAuthFlowError>> + 'a>> {
         Box::pin(open_browser(url, control))
+    }
+}
+
+struct HeadlessUrlLauncher<U> {
+    show_url: U,
+}
+
+impl<U> HeadlessUrlLauncher<U> {
+    fn new(show_url: U) -> Self {
+        Self { show_url }
+    }
+}
+
+impl<U> BrowserLauncher for HeadlessUrlLauncher<U>
+where
+    U: Fn(&str) -> Result<(), OAuthFlowError>,
+{
+    fn open<'a>(
+        &'a self,
+        url: &'a str,
+        _control: &'a LoginControl,
+    ) -> Pin<Box<dyn Future<Output = Result<(), OAuthFlowError>> + 'a>> {
+        let result = (self.show_url)(url);
+        Box::pin(async move { result })
     }
 }
 
@@ -1205,6 +1274,96 @@ mod tests {
             fields.get("code_challenge_method").map(String::as_str),
             Some("S256")
         );
+    }
+
+    #[test]
+    fn headless_callback_port_policy_is_closed_and_exact() {
+        assert!(validate_headless_callback_port(1455).is_ok());
+        assert!(validate_headless_callback_port(1457).is_ok());
+        for port in [0, 80, 1456, 3000, u16::MAX] {
+            let error = validate_headless_callback_port(port).unwrap_err();
+            assert_eq!(error.code, OAuthErrorCode::OAuthProtocol);
+            assert_eq!(error.stage, "callback_bind");
+        }
+
+        let options = AsyncLoginOptions::headless(1455).unwrap();
+        assert_eq!(options.callback_ports, vec![1455]);
+        assert_eq!(options.browser_timeout, Duration::from_secs(5 * 60));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn headless_url_launcher_calls_only_the_injected_sink() {
+        let urls = Arc::new(Mutex::new(Vec::new()));
+        let urls_out = urls.clone();
+        let launcher = HeadlessUrlLauncher::new(move |url: &str| {
+            urls_out.lock().unwrap().push(url.to_string());
+            Ok(())
+        });
+        let control = LoginControl::default();
+        launcher
+            .open("https://auth.example/once", &control)
+            .await
+            .unwrap();
+        assert_eq!(
+            *urls.lock().unwrap(),
+            ["https://auth.example/once".to_string()]
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn production_headless_login_rejects_port_before_url_or_network_work() {
+        let root = TempRoot::new();
+        let repository = repository(&root);
+        let url_calls = Arc::new(Mutex::new(0_u32));
+        let url_calls_out = url_calls.clone();
+        let error = run_production_login_headless(
+            &repository,
+            1456,
+            &LoginControl::default(),
+            |_| {},
+            move |_| {
+                *url_calls_out.lock().unwrap() += 1;
+                Ok(())
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code, OAuthErrorCode::OAuthProtocol);
+        assert_eq!(*url_calls.lock().unwrap(), 0);
+        assert_eq!(repository.status().unwrap().auth_generation, 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn occupied_exact_port_emits_no_authorization_url() {
+        let occupied = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = occupied.local_addr().unwrap().port();
+        let root = TempRoot::new();
+        let repository = repository(&root);
+        let urls = Arc::new(Mutex::new(Vec::<String>::new()));
+        let urls_out = urls.clone();
+        let options = AsyncLoginOptions {
+            issuer: "https://auth.openai.com".into(),
+            client_id: "client-test".into(),
+            callback_ports: vec![port],
+            browser_timeout: Duration::from_millis(50),
+        };
+        let error = run_browser_login_with_launcher(
+            &repository,
+            &direct_client(),
+            false,
+            &options,
+            &LoginControl::default(),
+            &|_| {},
+            &HeadlessUrlLauncher::new(move |url: &str| {
+                urls_out.lock().unwrap().push(url.to_string());
+                Ok(())
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code, OAuthErrorCode::CallbackUnavailable);
+        assert!(urls.lock().unwrap().is_empty());
+        assert_eq!(repository.status().unwrap().auth_generation, 0);
     }
 
     #[tokio::test(flavor = "current_thread")]

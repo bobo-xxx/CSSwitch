@@ -51,6 +51,28 @@ where
     login_async::run_production_login(&repository, control, progress).await
 }
 
+pub async fn run_production_login_headless<F, U>(
+    state_root: PathBuf,
+    callback_port: u16,
+    control: &LoginControl,
+    progress: F,
+    show_url: U,
+) -> Result<AuthStatus, OAuthFlowError>
+where
+    F: Fn(LoginProgress),
+    U: Fn(&str) -> Result<(), OAuthFlowError>,
+{
+    let repository = storage::AuthRepository::production(state_root);
+    login_async::run_production_login_headless(
+        &repository,
+        callback_port,
+        control,
+        progress,
+        show_url,
+    )
+    .await
+}
+
 pub fn production_status(state_root: PathBuf) -> Result<AuthStatus, OAuthFlowError> {
     storage::AuthRepository::production(state_root)
         .status()
