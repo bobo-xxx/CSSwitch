@@ -393,6 +393,26 @@ impl fmt::Debug for ProviderFailure {
 }
 
 impl AttemptDiagnostic {
+    fn without_failure(
+        outcome: AttemptOutcome,
+        context: &RouteContext,
+        snapshot: AttemptSnapshot,
+    ) -> Self {
+        Self {
+            outcome,
+            provider: context.provider,
+            route: context.route,
+            correlation_id: context.correlation_id.clone(),
+            posts: snapshot.posts,
+            repairs: snapshot.repairs,
+            delays_ms: snapshot.delays_ms,
+            mapped_status: None,
+            upstream_status: None,
+            failure_class: None,
+            retryable: None,
+        }
+    }
+
     pub(crate) fn failed(
         context: &RouteContext,
         posts: u8,
@@ -494,6 +514,24 @@ impl AttemptController {
             snapshot.repairs,
             snapshot.delays_ms,
             failure,
+        )
+    }
+
+    pub(crate) fn completed_diagnostic(&mut self) -> AttemptDiagnostic {
+        self.phase = AttemptPhase::Terminal;
+        AttemptDiagnostic::without_failure(
+            AttemptOutcome::Completed,
+            &self.context,
+            self.snapshot(),
+        )
+    }
+
+    pub(crate) fn cancelled_diagnostic(&mut self) -> AttemptDiagnostic {
+        self.phase = AttemptPhase::Terminal;
+        AttemptDiagnostic::without_failure(
+            AttemptOutcome::Cancelled,
+            &self.context,
+            self.snapshot(),
         )
     }
 

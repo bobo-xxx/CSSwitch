@@ -288,3 +288,28 @@ fn cancellation_is_terminal_from_ready_retry_and_inflight() {
         assert!(controller.begin_post().is_err());
     }
 }
+
+#[test]
+fn completed_and_cancelled_diagnostics_omit_failure_fields() {
+    let mut completed = AttemptController::new(context(RouteMode::Responses), false);
+    completed.begin_post().unwrap();
+    completed.mark_response_started().unwrap();
+    assert_eq!(
+        serde_json::to_value(completed.completed_diagnostic()).unwrap(),
+        serde_json::json!({
+            "outcome":"completed", "provider":"codex", "route":"responses",
+            "correlation_id":"corr-0001", "posts":1, "repairs":0, "delays_ms":[]
+        })
+    );
+
+    let mut cancelled = AttemptController::new(context(RouteMode::Responses), false);
+    cancelled.begin_post().unwrap();
+    cancelled.observe(FailureObservation::Cancelled).unwrap();
+    assert_eq!(
+        serde_json::to_value(cancelled.cancelled_diagnostic()).unwrap(),
+        serde_json::json!({
+            "outcome":"cancelled", "provider":"codex", "route":"responses",
+            "correlation_id":"corr-0001", "posts":1, "repairs":0, "delays_ms":[]
+        })
+    );
+}

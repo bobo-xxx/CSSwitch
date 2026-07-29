@@ -911,11 +911,18 @@ fn finish_codex_stream_error(stream: &mut TcpStream) {
     let _ = stream.flush();
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CodexStreamOutcome {
+    Completed,
+    Failed,
+    Cancelled,
+}
+
 fn forward_codex_stream<R: Read>(
     stream: &mut TcpStream,
     mut upstream: R,
     reducer: &mut codex_protocol::ResponsesReducer<'_>,
-) {
+) -> CodexStreamOutcome {
     if write!(
         stream,
         "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n"
@@ -923,18 +930,22 @@ fn forward_codex_stream<R: Read>(
     .and_then(|_| stream.flush())
     .is_err()
     {
-        return;
+        return CodexStreamOutcome::Cancelled;
     }
     match pump_codex_stream(&mut upstream, reducer, |chunk| write_chunk(stream, chunk)) {
-        Ok(()) => {}
-        Err(CodexPumpError::DownstreamWrite | CodexPumpError::Cancelled) => return,
+        Ok(()) => {
+            let _ = stream.write_all(b"0\r\n\r\n");
+            let _ = stream.flush();
+            CodexStreamOutcome::Completed
+        }
+        Err(CodexPumpError::DownstreamWrite | CodexPumpError::Cancelled) => {
+            CodexStreamOutcome::Cancelled
+        }
         Err(CodexPumpError::UpstreamRead | CodexPumpError::Protocol) => {
             finish_codex_stream_error(stream);
-            return;
+            CodexStreamOutcome::Failed
         }
     }
-    let _ = stream.write_all(b"0\r\n\r\n");
-    let _ = stream.flush();
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1254,6 +1265,7 @@ fn handle_codex_messages_with_policy_and_runtime(
                             controller
                                 .observe(crate::provider_failure::FailureObservation::Cancelled)
                                 .expect("cancellation is terminal");
+                            runtime.emit(controller.cancelled_diagnostic());
                             return;
                         }
                     }
@@ -1262,7 +1274,10 @@ fn handle_codex_messages_with_policy_and_runtime(
                         write_provider_failure(stream, &failure);
                         return;
                     }
-                    crate::provider_failure::AttemptDirective::Cancel => return,
+                    crate::provider_failure::AttemptDirective::Cancel => {
+                        runtime.emit(controller.cancelled_diagnostic());
+                        return;
+                    }
                     crate::provider_failure::AttemptDirective::RepairOnce(
                         crate::provider_failure::RepairKind::OmitAutomaticToolChoice,
                     ) => {
@@ -1286,16 +1301,55 @@ fn handle_codex_messages_with_policy_and_runtime(
         &signer,
     );
     if is_stream {
-        forward_codex_stream(stream, upstream, &mut reducer);
+        match forward_codex_stream(stream, upstream, &mut reducer) {
+            CodexStreamOutcome::Completed => runtime.emit(controller.completed_diagnostic()),
+            CodexStreamOutcome::Cancelled => runtime.emit(controller.cancelled_diagnostic()),
+            CodexStreamOutcome::Failed => {
+                let directive = controller
+                    .observe(crate::provider_failure::FailureObservation::Protocol(
+                        crate::provider_failure::ProtocolKind::InvalidResponse,
+                    ))
+                    .expect("response-started protocol failure is terminal");
+                let crate::provider_failure::AttemptDirective::Fail(failure) = directive else {
+                    panic!("response-started failure cannot replay");
+                };
+                runtime.emit(controller.failed_diagnostic(&failure));
+            }
+        }
     } else {
         match collect_codex_nonstream(upstream, stream, &mut reducer) {
-            Err(CodexNonstreamError::DownstreamClosed) => {}
+            Err(CodexNonstreamError::DownstreamClosed) => {
+                runtime.emit(controller.cancelled_diagnostic())
+            }
             Err(CodexNonstreamError::UpstreamRead | CodexNonstreamError::Protocol) => {
-                api_error_json(stream, 502, "Codex upstream protocol error");
+                let directive = controller
+                    .observe(crate::provider_failure::FailureObservation::Protocol(
+                        crate::provider_failure::ProtocolKind::InvalidResponse,
+                    ))
+                    .expect("response-started protocol failure is terminal");
+                let crate::provider_failure::AttemptDirective::Fail(failure) = directive else {
+                    panic!("response-started failure cannot replay");
+                };
+                runtime.emit(controller.failed_diagnostic(&failure));
+                write_provider_failure(stream, &failure);
             }
             Ok(()) => match reducer.nonstream_response() {
-                Ok(response) => write_json(stream, 200, "OK", response),
-                Err(_) => api_error_json(stream, 502, "Codex upstream protocol error"),
+                Ok(response) => {
+                    write_json(stream, 200, "OK", response);
+                    runtime.emit(controller.completed_diagnostic());
+                }
+                Err(_) => {
+                    let directive = controller
+                        .observe(crate::provider_failure::FailureObservation::Protocol(
+                            crate::provider_failure::ProtocolKind::InvalidResponse,
+                        ))
+                        .expect("response-started reducer failure is terminal");
+                    let crate::provider_failure::AttemptDirective::Fail(failure) = directive else {
+                        panic!("response-started failure cannot replay");
+                    };
+                    runtime.emit(controller.failed_diagnostic(&failure));
+                    write_provider_failure(stream, &failure);
+                }
             },
         }
     }
@@ -2351,11 +2405,12 @@ mod tests {
     use super::{
         apply_dsml_nonstream, caller_allows_automatic_tool_choice, collect_codex_nonstream,
         dsml_stream_filter, forward_stream_body, handle_codex_messages_with_catalog,
-        handle_codex_messages_with_secrets, handle_post, map_codex_auth_error,
-        openai_chat_reasoning_signer, pump_codex_stream, stream_error_event,
-        write_codex_models_response, CodexComponents, CodexNonstreamError, CodexPumpError,
-        KimiServerToolFilter, ProductionCodexAttemptRuntime, RequestHead, RequestNonceGenerator,
-        StreamFilter, StreamTermination,
+        handle_codex_messages_with_policy_and_runtime, handle_codex_messages_with_secrets,
+        handle_post, map_codex_auth_error, openai_chat_reasoning_signer, pump_codex_stream,
+        stream_error_event, write_codex_models_response, CodexAttemptRuntime, CodexComponents,
+        CodexNonstreamError, CodexPumpError, CodexRequestPolicy, KimiServerToolFilter,
+        ProductionCodexAttemptRuntime, RequestHead, RequestNonceGenerator, StreamFilter,
+        StreamTermination,
     };
     use crate::codex_auth::{InferenceSecrets, OAuthErrorCode, OAuthFlowError};
     use crate::codex_models::CodexModelCatalog;
@@ -3420,6 +3475,27 @@ mod tests {
         );
     }
 
+    struct CapturingAttemptRuntime {
+        diagnostics: Arc<Mutex<Vec<Value>>>,
+    }
+
+    impl CodexAttemptRuntime for CapturingAttemptRuntime {
+        fn wait(
+            &mut self,
+            _delay_ms: u64,
+            _cancellation: &crate::codex_transport::CodexCancellation,
+        ) -> bool {
+            panic!("direct transport cancellation must not enter retry wait")
+        }
+
+        fn emit(&mut self, diagnostic: crate::provider_failure::AttemptDiagnostic) {
+            self.diagnostics
+                .lock()
+                .unwrap()
+                .push(serde_json::to_value(diagnostic).unwrap());
+        }
+    }
+
     #[test]
     fn codex_disconnect_cancels_stalled_upstream_for_stream_and_nonstream() {
         for is_stream in [false, true] {
@@ -3450,14 +3526,21 @@ mod tests {
             let downstream_client = TcpStream::connect(downstream_address).unwrap();
             let (mut downstream, _) = downstream_listener.accept().unwrap();
             let (handler_done_tx, handler_done_rx) = std::sync::mpsc::channel();
+            let diagnostics = Arc::new(Mutex::new(Vec::new()));
+            let diagnostics_for_handler = Arc::clone(&diagnostics);
             let handler = thread::spawn(move || {
-                handle_codex_messages_with_secrets(
+                let mut runtime = CapturingAttemptRuntime {
+                    diagnostics: diagnostics_for_handler,
+                };
+                handle_codex_messages_with_policy_and_runtime(
                     &mut downstream,
                     &codex_request(is_stream),
                     is_stream,
                     InferenceSecrets::for_test("access", "account"),
                     &transport,
+                    CodexRequestPolicy::default(),
                     |_, _| panic!("cancelled request must not reject auth"),
+                    &mut runtime,
                 );
                 handler_done_tx.send(()).unwrap();
             });
@@ -3470,6 +3553,11 @@ mod tests {
                 .recv_timeout(Duration::from_secs(1))
                 .expect("downstream disconnect must cancel a stalled upstream read");
             assert_eq!(upstream_requests.load(Ordering::SeqCst), 1);
+            let diagnostics = diagnostics.lock().unwrap();
+            assert_eq!(diagnostics.len(), 1);
+            assert_eq!(diagnostics[0]["outcome"], "cancelled");
+            assert_eq!(diagnostics[0]["posts"], 1);
+            assert!(diagnostics[0].get("failure_class").is_none());
 
             release_upstream_tx.send(()).unwrap();
             handler.join().unwrap();

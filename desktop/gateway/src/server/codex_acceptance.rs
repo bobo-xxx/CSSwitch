@@ -12,7 +12,7 @@ use super::{
     handle_codex_messages_with_policy_and_runtime, CodexAttemptRuntime, CodexRequestPolicy,
 };
 use crate::codex_auth::InferenceSecrets;
-use crate::codex_transport::CodexTransport;
+use crate::codex_transport::{CodexCancellation, CodexTransport};
 use crate::provider_failure::AttemptDiagnostic;
 
 const ACCESS_SENTINEL: &str = "ACCEPTANCE_ACCESS_TOKEN_SENTINEL";
@@ -114,6 +114,15 @@ impl AcceptanceResult {
     fn sse_events(&self) -> Vec<ParsedSseEvent> {
         parse_sse_events(&self.sse_body())
     }
+}
+
+fn only_diagnostic(result: &AcceptanceResult) -> &Value {
+    assert_eq!(
+        result.diagnostics.len(),
+        1,
+        "one final attempt diagnostic required"
+    );
+    &result.diagnostics[0]
 }
 
 #[derive(Debug, PartialEq)]
@@ -876,6 +885,10 @@ fn contract_partial_stream_failure_never_replays() {
         .as_str()
         .is_some_and(|message| !message.is_empty()));
     assert_forbidden_sentinels_absent(&result.text());
+    assert_eq!(only_diagnostic(&result)["outcome"], "failed");
+    assert_eq!(only_diagnostic(&result)["posts"], 1);
+    assert_eq!(only_diagnostic(&result)["failure_class"], "protocol");
+    assert_eq!(only_diagnostic(&result)["retryable"], false);
 }
 
 #[test]
@@ -904,6 +917,15 @@ fn contract_failure_schema_and_caller_redaction() {
         true,
     );
     assert_eq!(result.json()["error"]["request_id"], "req-safe-500");
+    assert_eq!(only_diagnostic(&result)["outcome"], "failed");
+    assert_eq!(only_diagnostic(&result)["posts"], 3);
+    assert_eq!(
+        only_diagnostic(&result)["delays_ms"],
+        serde_json::json!([500, 1000])
+    );
+    let rendered_diagnostics = serde_json::to_string(&result.diagnostics).unwrap();
+    assert_forbidden_sentinels_absent(&rendered_diagnostics);
+    assert!(!rendered_diagnostics.contains("req-safe-500"));
 }
 
 #[test]
@@ -961,6 +983,12 @@ fn contract_rate_limit_retries_twice_then_succeeds() {
     assert_eq!(result.delays_ms, vec![0, 0]);
     assert_eq!(result.script.remaining_steps, 0);
     assert_eq!(result.script.unexpected_posts, 0);
+    assert_eq!(only_diagnostic(&result)["outcome"], "completed");
+    assert_eq!(only_diagnostic(&result)["posts"], 3);
+    assert_eq!(
+        only_diagnostic(&result)["delays_ms"],
+        serde_json::json!([0, 0])
+    );
 }
 
 #[test]
@@ -1095,7 +1123,7 @@ fn contract_network_only_exhaustion_omits_unknown_upstream_metadata() {
 }
 
 #[test]
-fn contract_cancellation_during_retry_wait_stops_without_failure_output() {
+fn attempt_retry_wait_cancellation_stops_without_failure_output() {
     let result = run_case_with_runtime(
         AcceptanceCase {
             request: anthropic_request(false),
@@ -1114,7 +1142,56 @@ fn contract_cancellation_during_retry_wait_stops_without_failure_output() {
     assert_eq!(result.script.unexpected_posts, 0);
     assert_eq!(result.delays_ms, vec![500]);
     assert!(result.downstream.is_empty());
-    assert!(result.diagnostics.is_empty());
+    assert_eq!(only_diagnostic(&result)["outcome"], "cancelled");
+    assert_eq!(only_diagnostic(&result)["posts"], 1);
+    assert_eq!(
+        only_diagnostic(&result)["delays_ms"],
+        serde_json::json!([500])
+    );
+}
+
+#[derive(Default)]
+struct CancellingAttemptRuntime {
+    diagnostics: Vec<Value>,
+}
+
+impl CodexAttemptRuntime for CancellingAttemptRuntime {
+    fn wait(&mut self, _delay_ms: u64, cancellation: &CodexCancellation) -> bool {
+        cancellation.cancel();
+        false
+    }
+
+    fn emit(&mut self, diagnostic: AttemptDiagnostic) {
+        self.diagnostics
+            .push(serde_json::to_value(diagnostic).unwrap());
+    }
+}
+
+#[test]
+fn attempt_wait_cancellation_emits_one_final_diagnostic_without_replay() {
+    let upstream = ScriptedCodexUpstream::start(vec![transient_step(500, "Internal Server Error")]);
+    let transport = CodexTransport::for_test(upstream.endpoint("/responses")).unwrap();
+    let mut runtime = CancellingAttemptRuntime::default();
+    let downstream = capture_downstream(|stream| {
+        handle_codex_messages_with_policy_and_runtime(
+            stream,
+            &anthropic_request(false),
+            false,
+            InferenceSecrets::for_test(ACCESS_SENTINEL, ACCOUNT_SENTINEL),
+            &transport,
+            CodexRequestPolicy::default(),
+            |_status, _generation| {},
+            &mut runtime,
+        );
+    });
+    let script = upstream.finish();
+    assert!(downstream.is_empty());
+    assert_eq!(script.requests.len(), 1);
+    assert_eq!(script.remaining_steps, 0);
+    assert_eq!(runtime.diagnostics.len(), 1);
+    assert_eq!(runtime.diagnostics[0]["outcome"], "cancelled");
+    assert_eq!(runtime.diagnostics[0]["posts"], 1);
+    assert_eq!(runtime.diagnostics[0]["delays_ms"], serde_json::json!([0]));
 }
 
 fn assert_transient_exhaustion(status: u16, reason: &'static str, downstream_status: u16) {
@@ -1216,6 +1293,10 @@ fn assert_safe_repair(choice: Option<Value>) {
     assert!(!second.contains_key("tool_choice"));
     assert_eq!(first, second);
     assert!(result.delays_ms.is_empty());
+    assert_eq!(only_diagnostic(&result)["outcome"], "completed");
+    assert_eq!(only_diagnostic(&result)["posts"], 2);
+    assert_eq!(only_diagnostic(&result)["repairs"], 1);
+    assert_eq!(only_diagnostic(&result)["delays_ms"], serde_json::json!([]));
 }
 
 #[test]
@@ -1504,6 +1585,8 @@ fn harness_runner_uses_real_handler_and_transport() {
     assert_eq!(result.json()["content"][0]["text"], "hello");
     assert!(result.auth_rejections.is_empty());
     assert!(result.text().starts_with("HTTP/1.1 200"));
+    assert_eq!(only_diagnostic(&result)["outcome"], "completed");
+    assert_eq!(only_diagnostic(&result)["posts"], 1);
 }
 
 #[test]
