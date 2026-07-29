@@ -919,7 +919,7 @@ fn contract_403_is_authorization_and_not_retried() {
 
 #[test]
 fn harness_feature_gate_compiles() {
-    assert!(cfg!(all(test, feature = "acceptance-build")));
+    const { assert!(cfg!(all(test, feature = "acceptance-build"))) };
 }
 
 #[test]
