@@ -136,3 +136,155 @@ fn diagnostic_schema_has_no_arbitrary_string_slot() {
         })
     );
 }
+
+fn http(
+    status: u16,
+    rate_kind: Option<RateKind>,
+    retry_after_seconds: Option<u64>,
+) -> FailureObservation {
+    FailureObservation::Http {
+        status,
+        rate_kind,
+        retry_after_seconds,
+        request_id: None,
+        error_code: ErrorCode::Absent,
+        error_param: ErrorParam::Absent,
+    }
+}
+
+#[test]
+fn transient_sequence_uses_override_then_fallback_and_stops_at_three_posts() {
+    let mut controller = AttemptController::new(context(RouteMode::Responses), false);
+    controller.begin_post().unwrap();
+    assert_eq!(
+        controller.observe(http(500, None, Some(90))).unwrap(),
+        AttemptDirective::RetryAfter(60_000)
+    );
+    controller.begin_post().unwrap();
+    assert_eq!(
+        controller.observe(http(500, None, None)).unwrap(),
+        AttemptDirective::RetryAfter(1_000)
+    );
+    controller.begin_post().unwrap();
+    let failure = match controller.observe(http(500, None, None)).unwrap() {
+        AttemptDirective::Fail(failure) => failure,
+        directive => panic!("expected terminal failure, got {directive:?}"),
+    };
+    assert_eq!(failure.status(), 502);
+    assert!(failure.retryable());
+    assert_eq!(controller.snapshot().posts, 3);
+    assert_eq!(controller.snapshot().delays_ms, vec![60_000, 1_000]);
+    assert!(controller.begin_post().is_err());
+}
+
+#[test]
+fn quota_and_unknown_429_do_not_retry() {
+    let mut quota = AttemptController::new(context(RouteMode::Responses), false);
+    quota.begin_post().unwrap();
+    let quota_failure = match quota
+        .observe(http(429, Some(RateKind::Quota), Some(0)))
+        .unwrap()
+    {
+        AttemptDirective::Fail(failure) => failure,
+        directive => panic!("expected quota failure, got {directive:?}"),
+    };
+    assert_eq!(quota_failure.failure_class(), FailureClass::Quota);
+    assert!(!quota_failure.retryable());
+    assert_eq!(quota.snapshot().posts, 1);
+
+    let mut unknown = AttemptController::new(context(RouteMode::Responses), false);
+    unknown.begin_post().unwrap();
+    let unknown_failure = match unknown.observe(http(429, None, None)).unwrap() {
+        AttemptDirective::Fail(failure) => failure,
+        directive => panic!("expected unknown-rate failure, got {directive:?}"),
+    };
+    assert_eq!(unknown_failure.failure_class(), FailureClass::RateLimit);
+    assert!(!unknown_failure.retryable());
+    assert_eq!(unknown.snapshot().posts, 1);
+}
+
+#[test]
+fn exact_first_post_lite_capability_can_repair_once_without_retry_budget() {
+    let mut controller = AttemptController::new(context(RouteMode::ResponsesLite), true);
+    controller.begin_post().unwrap();
+    let observation = FailureObservation::Http {
+        status: 400,
+        rate_kind: None,
+        retry_after_seconds: None,
+        request_id: None,
+        error_code: ErrorCode::UnsupportedValue,
+        error_param: ErrorParam::ToolChoice,
+    };
+    assert_eq!(
+        controller.observe(observation.clone()).unwrap(),
+        AttemptDirective::RepairOnce(RepairKind::OmitAutomaticToolChoice)
+    );
+    controller.begin_post().unwrap();
+    assert!(matches!(
+        controller.observe(observation).unwrap(),
+        AttemptDirective::Fail(_)
+    ));
+    assert_eq!(controller.snapshot().posts, 2);
+    assert_eq!(controller.snapshot().repairs, 1);
+    assert!(controller.snapshot().delays_ms.is_empty());
+    assert!(controller.begin_post().is_err());
+}
+
+#[test]
+fn repair_is_forbidden_after_retry_or_response_start() {
+    let capability = FailureObservation::Http {
+        status: 400,
+        rate_kind: None,
+        retry_after_seconds: None,
+        request_id: None,
+        error_code: ErrorCode::UnsupportedValue,
+        error_param: ErrorParam::ToolChoice,
+    };
+
+    let mut after_retry = AttemptController::new(context(RouteMode::ResponsesLite), true);
+    after_retry.begin_post().unwrap();
+    assert!(matches!(
+        after_retry.observe(http(500, None, None)).unwrap(),
+        AttemptDirective::RetryAfter(500)
+    ));
+    after_retry.begin_post().unwrap();
+    assert!(matches!(
+        after_retry.observe(capability.clone()).unwrap(),
+        AttemptDirective::Fail(_)
+    ));
+
+    let mut after_start = AttemptController::new(context(RouteMode::ResponsesLite), true);
+    after_start.begin_post().unwrap();
+    after_start.mark_response_started().unwrap();
+    assert!(matches!(
+        after_start
+            .observe(FailureObservation::Protocol(ProtocolKind::InvalidResponse))
+            .unwrap(),
+        AttemptDirective::Fail(_)
+    ));
+    assert!(after_start.begin_post().is_err());
+}
+
+#[test]
+fn cancellation_is_terminal_from_ready_retry_and_inflight() {
+    for mut controller in [
+        AttemptController::new(context(RouteMode::Responses), false),
+        {
+            let mut value = AttemptController::new(context(RouteMode::Responses), false);
+            value.begin_post().unwrap();
+            value.observe(http(500, None, None)).unwrap();
+            value
+        },
+        {
+            let mut value = AttemptController::new(context(RouteMode::Responses), false);
+            value.begin_post().unwrap();
+            value
+        },
+    ] {
+        assert_eq!(
+            controller.observe(FailureObservation::Cancelled).unwrap(),
+            AttemptDirective::Cancel
+        );
+        assert!(controller.begin_post().is_err());
+    }
+}

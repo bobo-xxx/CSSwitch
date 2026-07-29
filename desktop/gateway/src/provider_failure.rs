@@ -416,5 +416,200 @@ impl AttemptDiagnostic {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RepairKind {
+    OmitAutomaticToolChoice,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AttemptPhase {
+    Ready,
+    InFlight,
+    RetryAuthorized,
+    RepairAuthorized,
+    UpstreamOpen,
+    Terminal,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum AttemptDirective {
+    RetryAfter(u64),
+    RepairOnce(RepairKind),
+    Fail(ProviderFailure),
+    Cancel,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TransitionError {
+    PostNotAuthorized,
+    ObservationNotAuthorized,
+    ResponseAlreadyStarted,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct AttemptSnapshot {
+    pub(crate) posts: u8,
+    pub(crate) repairs: u8,
+    pub(crate) delays_ms: Vec<u64>,
+    pub(crate) response_started: bool,
+}
+
+pub(crate) struct AttemptController {
+    context: RouteContext,
+    repair_enabled: bool,
+    phase: AttemptPhase,
+    posts: u8,
+    repairs: u8,
+    delays_ms: Vec<u64>,
+    response_started: bool,
+}
+
+impl AttemptController {
+    pub(crate) fn new(context: RouteContext, repair_enabled: bool) -> Self {
+        Self {
+            context,
+            repair_enabled,
+            phase: AttemptPhase::Ready,
+            posts: 0,
+            repairs: 0,
+            delays_ms: Vec::new(),
+            response_started: false,
+        }
+    }
+
+    pub(crate) fn snapshot(&self) -> AttemptSnapshot {
+        AttemptSnapshot {
+            posts: self.posts,
+            repairs: self.repairs,
+            delays_ms: self.delays_ms.clone(),
+            response_started: self.response_started,
+        }
+    }
+
+    pub(crate) fn begin_post(&mut self) -> Result<(), TransitionError> {
+        let authorized = matches!(
+            self.phase,
+            AttemptPhase::Ready | AttemptPhase::RetryAuthorized | AttemptPhase::RepairAuthorized
+        );
+        let maximum = if self.repairs == 0 {
+            self.context.retry_policy.max_posts
+        } else {
+            2
+        };
+        if !authorized || self.posts >= maximum {
+            return Err(TransitionError::PostNotAuthorized);
+        }
+        self.posts += 1;
+        self.phase = AttemptPhase::InFlight;
+        Ok(())
+    }
+
+    pub(crate) fn mark_response_started(&mut self) -> Result<(), TransitionError> {
+        if self.phase != AttemptPhase::InFlight || self.response_started {
+            return Err(TransitionError::ResponseAlreadyStarted);
+        }
+        self.response_started = true;
+        self.phase = AttemptPhase::UpstreamOpen;
+        Ok(())
+    }
+
+    pub(crate) fn observe(
+        &mut self,
+        observation: FailureObservation,
+    ) -> Result<AttemptDirective, TransitionError> {
+        if matches!(&observation, FailureObservation::Cancelled) {
+            if self.phase == AttemptPhase::Terminal {
+                return Err(TransitionError::ObservationNotAuthorized);
+            }
+            self.phase = AttemptPhase::Terminal;
+            return Ok(AttemptDirective::Cancel);
+        }
+        if !matches!(
+            self.phase,
+            AttemptPhase::InFlight | AttemptPhase::UpstreamOpen
+        ) {
+            return Err(TransitionError::ObservationNotAuthorized);
+        }
+        if self.response_started {
+            self.phase = AttemptPhase::Terminal;
+            return Ok(AttemptDirective::Fail(ProviderFailure::from_observation(
+                &self.context,
+                &observation,
+                false,
+            )));
+        }
+
+        let exact_repair = matches!(
+            &observation,
+            FailureObservation::Http {
+                status: 400,
+                error_code: ErrorCode::UnsupportedValue,
+                error_param: ErrorParam::ToolChoice,
+                ..
+            }
+        );
+        let can_repair = exact_repair
+            && self.repair_enabled
+            && self.context.route == RouteMode::ResponsesLite
+            && self.posts == 1
+            && self.repairs == 0
+            && self.delays_ms.is_empty();
+        if can_repair {
+            self.repairs = 1;
+            self.phase = AttemptPhase::RepairAuthorized;
+            return Ok(AttemptDirective::RepairOnce(
+                RepairKind::OmitAutomaticToolChoice,
+            ));
+        }
+
+        let proven_rate = matches!(
+            &observation,
+            FailureObservation::Http {
+                status: 429,
+                rate_kind: Some(RateKind::RateLimit),
+                ..
+            }
+        );
+        let transient_http = matches!(
+            &observation,
+            FailureObservation::Http {
+                status: 408 | 409 | 500..=599,
+                ..
+            }
+        );
+        let transient_network = matches!(&observation, FailureObservation::Network(_));
+        let can_retry = self.repairs == 0
+            && self.posts < self.context.retry_policy.max_posts
+            && (proven_rate || transient_http || transient_network);
+        if can_retry {
+            let override_seconds = match &observation {
+                FailureObservation::Http {
+                    retry_after_seconds,
+                    ..
+                } => *retry_after_seconds,
+                FailureObservation::Network(_)
+                | FailureObservation::Protocol(_)
+                | FailureObservation::Cancelled => None,
+            };
+            let delay_ms = override_seconds
+                .map(|seconds| {
+                    seconds.min(self.context.retry_policy.retry_after_cap_seconds) * 1_000
+                })
+                .unwrap_or(self.context.retry_policy.fallback_delays_ms[(self.posts - 1) as usize]);
+            self.delays_ms.push(delay_ms);
+            self.phase = AttemptPhase::RetryAuthorized;
+            return Ok(AttemptDirective::RetryAfter(delay_ms));
+        }
+
+        let exhausted = proven_rate || transient_http || transient_network;
+        self.phase = AttemptPhase::Terminal;
+        Ok(AttemptDirective::Fail(ProviderFailure::from_observation(
+            &self.context,
+            &observation,
+            exhausted,
+        )))
+    }
+}
+
 #[cfg(test)]
 mod tests;
