@@ -2,7 +2,7 @@
 
 Date: 2026-07-29
 
-Status: approved in interactive design review; pending review of this written capture
+Status: approved in interactive design review and written-spec review
 
 ## Problem
 
