@@ -453,6 +453,21 @@ fn tool_request(choice: Option<Value>) -> Value {
     request
 }
 
+fn typed_automatic_choice_rejection() -> UpstreamStep {
+    UpstreamStep::json(
+        400,
+        "Bad Request",
+        serde_json::json!({
+            "error": {
+                "type": "invalid_request_error",
+                "code": "unsupported_value",
+                "param": "tool_choice",
+                "message": "synthetic typed rejection"
+            }
+        }),
+    )
+}
+
 fn complete_sse() -> Vec<u8> {
     [
         serde_json::json!({"type":"response.created","response":{"id":"resp"}}),
@@ -647,6 +662,71 @@ fn contract_lite_non_equivalent_tool_choices_never_post() {
         assert_eq!(result.script.remaining_steps, 0);
         assert_eq!(result.script.unexpected_posts, 0);
     }
+}
+
+fn assert_safe_repair(choice: Option<Value>) {
+    let result = run_case(AcceptanceCase {
+        request: tool_request(choice),
+        is_stream: false,
+        use_responses_lite: true,
+        endpoint_path: "/responses",
+        steps: vec![
+            typed_automatic_choice_rejection(),
+            UpstreamStep::Sse(complete_sse()),
+        ],
+    });
+    assert_eq!(result.status(), 200);
+    assert_eq!(result.script.requests.len(), 2);
+    assert_eq!(result.script.remaining_steps, 0);
+    let mut first = result.script.requests[0]
+        .body
+        .as_object()
+        .expect("first request object")
+        .clone();
+    let second = result.script.requests[1]
+        .body
+        .as_object()
+        .expect("second request object")
+        .clone();
+    assert_eq!(
+        first.remove("tool_choice"),
+        Some(Value::String("auto".into()))
+    );
+    assert!(!second.contains_key("tool_choice"));
+    assert_eq!(first, second);
+}
+
+#[test]
+fn contract_safe_repair_for_absent_choice() {
+    assert_safe_repair(None);
+}
+
+#[test]
+fn contract_safe_repair_for_explicit_auto() {
+    assert_safe_repair(Some(serde_json::json!({"type": "auto"})));
+}
+
+#[test]
+fn contract_unproven_error_text_does_not_authorize_repair() {
+    let result = run_case(AcceptanceCase {
+        request: tool_request(Some(serde_json::json!({"type": "auto"}))),
+        is_stream: false,
+        use_responses_lite: true,
+        endpoint_path: "/responses",
+        steps: vec![
+            UpstreamStep::json(
+                400,
+                "Bad Request",
+                serde_json::json!({
+                    "error": {"message": "automatic tool_choice is unsupported"}
+                }),
+            ),
+            UpstreamStep::Sse(complete_sse()),
+        ],
+    });
+    assert_eq!(result.script.requests.len(), 1);
+    assert_eq!(result.script.remaining_steps, 1);
+    assert_eq!(result.script.unexpected_posts, 0);
 }
 
 fn assert_permanent_4xx(status: u16, reason: &'static str) {
