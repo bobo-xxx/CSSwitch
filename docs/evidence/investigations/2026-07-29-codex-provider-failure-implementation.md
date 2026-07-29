@@ -8,7 +8,7 @@ Ticket 05 implements the Provider Failure Contract through the real Codex handle
 
 ## Revision and environment
 
-The final-review-remediated implementation was tested from a clean worktree at revision `6ea1450d5db7a0f0bb1ef15b9d5067d06d058aad` before this evidence-only commit. The literal revision and environment commands and outputs were:
+The parser-bound-remediated implementation was tested from a clean worktree at revision `2b3a1f4ce77dccd0c14e44f89ab72a588eb14581` before this evidence-only commit. The literal revision and environment commands and outputs were:
 
 ```text
 $ git status --short
@@ -16,7 +16,7 @@ $ git status --short
 exit 0
 
 $ git rev-parse HEAD
-6ea1450d5db7a0f0bb1ef15b9d5067d06d058aad
+2b3a1f4ce77dccd0c14e44f89ab72a588eb14581
 exit 0
 
 $ rustc --version
@@ -32,11 +32,16 @@ Linux shengxin02 6.8.0-90-generic #91~22.04.1-Ubuntu SMP PREEMPT_DYNAMIC Thu Nov
 exit 0
 ```
 
-The implementation files were already committed at the tested revision, so the conditional implementation staging and commit commands below were not run and no redundant implementation commit was created:
+The parser-bound remediation was committed before the immutable gate run:
 
 ```text
-git add desktop/gateway/src/lib.rs desktop/gateway/src/provider_failure.rs desktop/gateway/src/provider_failure/tests.rs desktop/gateway/src/codex_transport.rs desktop/gateway/src/server.rs desktop/gateway/src/server/codex_acceptance.rs
-git commit -m "feat: complete Codex provider failure contract"
+$ git add desktop/gateway/src/codex_transport.rs
+exit 0
+
+$ git commit -m "fix: bound Codex failure parser memory"
+[feature/codex-provider-failure 2b3a1f4] fix: bound Codex failure parser memory
+1 file changed, 157 insertions(+), 43 deletions(-)
+exit 0
 ```
 
 ## Verification results
@@ -55,7 +60,7 @@ exit 0
 
 ```text
 $ cargo test --offline --manifest-path desktop/gateway/Cargo.toml provider_failure::tests -- --test-threads=1
-lib: 12 passed; 0 failed; 0 ignored; 0 measured; 290 filtered out
+lib: 12 passed; 0 failed; 0 ignored; 0 measured; 293 filtered out
 main: 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 codex_auth_cli: 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out
 exit 0
@@ -63,7 +68,7 @@ exit 0
 
 ```text
 $ cargo test --offline --manifest-path desktop/gateway/Cargo.toml codex_transport::tests -- --test-threads=1
-lib: 12 passed; 0 failed; 0 ignored; 0 measured; 290 filtered out
+lib: 15 passed; 0 failed; 0 ignored; 0 measured; 290 filtered out
 main: 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 codex_auth_cli: 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out
 exit 0
@@ -71,7 +76,7 @@ exit 0
 
 ```text
 $ cargo test --offline --manifest-path desktop/gateway/Cargo.toml --features acceptance-build 'server::codex_acceptance::harness_' -- --nocapture --test-threads=1
-lib: 8 passed; 0 failed; 0 ignored; 0 measured; 331 filtered out
+lib: 8 passed; 0 failed; 0 ignored; 0 measured; 334 filtered out
 main: 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 codex_auth_cli: 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out
 exit 0
@@ -79,7 +84,7 @@ exit 0
 
 ```text
 $ cargo test --offline --manifest-path desktop/gateway/Cargo.toml --features acceptance-build 'server::codex_acceptance::contract_' -- --nocapture --test-threads=1
-lib: 27 passed; 0 failed; 0 ignored; 0 measured; 312 filtered out
+lib: 27 passed; 0 failed; 0 ignored; 0 measured; 315 filtered out
 main: 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 codex_auth_cli: 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out
 exit 0
@@ -87,7 +92,7 @@ exit 0
 
 ```text
 $ cargo test --offline --manifest-path desktop/gateway/Cargo.toml codex_ -- --test-threads=1
-lib: 155 passed; 0 failed; 0 ignored; 0 measured; 147 filtered out
+lib: 158 passed; 0 failed; 0 ignored; 0 measured; 147 filtered out
 main: 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 codex_auth_cli: 1 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out
 exit 0
@@ -95,7 +100,7 @@ exit 0
 
 ```text
 $ cargo test --offline --manifest-path desktop/gateway/Cargo.toml --all-features -- --test-threads=1
-lib: 339 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+lib: 342 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 main: 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 codex_auth_cli: 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 doc tests: 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
@@ -111,11 +116,11 @@ server::codex_acceptance::attempt_wait_cancellation_emits_one_final_diagnostic_w
 
 ```text
 $ cargo clippy --offline --manifest-path desktop/gateway/Cargo.toml --all-targets --all-features -- -D warnings
-Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.15s
+Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.13s
 exit 0; no warnings
 ```
 
-The accepted harness passes 8/8, the accepted Provider Failure Contract passes 27/27, and the non-contract attempt integrations pass 2/2. The pure controller suite passes 12/12 and the transport suite passes 12/12.
+The accepted harness passes 8/8, the accepted Provider Failure Contract passes 27/27, and the non-contract attempt integrations pass 2/2. The pure controller suite passes 12/12 and the transport suite passes 15/15.
 
 ## Behavioral evidence
 
@@ -133,10 +138,12 @@ The accepted harness passes 8/8, the accepted Provider Failure Contract passes 2
 
 Caller envelopes preserve legacy Anthropic fields and add only closed structured metadata. Diagnostics contain only outcome, provider, route, correlation ID, POST/repair/delay counts, and failure-only mapped status, optional upstream status, class, and retryability. Request IDs are positive-allowlisted for caller output but excluded from diagnostics. Raw bodies, prompts, credentials, account identifiers, cookies, headers, and private URLs cannot enter the controller or diagnostic types.
 
-Failed-body projection now admits body collection only when reqwest exposes a validated `Content-Length` and the entire declared body fits a caller-owned memory budget below 16 KiB. That budget reserves equal worst-case storage for decoded allowlisted strings plus fixed typed facts, so retained input plus parsed output stays within 16 KiB. Unknown-length, invalid-length, and oversized bodies are not polled by CSSwitch and conservatively project no body-derived facts. The parser borrows normal strings, owns only escaped values for `error.type`, `error.code`, and `error.param`, ignores all other fields, and immediately reduces those values to closed enums.
+Failed-body projection now admits body collection only when reqwest exposes a validated `Content-Length` and the entire declared body fits a conservative memory budget below 16 KiB. The calculation reserves three input-sized regions plus fixed typed storage: one for the actual retained `Vec` capacity and two for serde_json's escaped-string scratch contents and amortized capacity slack. The collector rechecks the actual allocated input capacity before parsing. serde_json's private scratch capacity is not directly exposed for measurement, so the bound deliberately uses this conservative reserve under the pinned Vec-backed parser rather than claiming runtime observation of that scratch allocation.
+
+The three projected strings are visited directly into closed enums; no decoded `String` or `Cow` survives a visitor. Unknown-length, invalid-length, and over-budget bodies are not parsed or projected by CSSwitch and conservatively produce no body-derived facts. Focused regressions prove the admission arithmetic, exercise a late JSON escape at the exact admitted limit, and prove that a valid repair-shaped body one byte over the limit is rejected before its capability facts can be projected.
 
 ## Explicit limitations
 
 This evidence does not verify an installed runtime or live Codex subscription; Ticket 06 owns that work. It does not add the shared API-key adapter; Ticket 07 owns that work. No macOS runtime was available, so macOS source compatibility is covered by the shared Rust build/test surface rather than a real macOS run.
 
-Reqwest exposes already-materialized `Bytes` frames and does not provide a caller-sized read API for `Response::chunk()`. CSSwitch therefore enforces the strict bound at its caller-owned admission and retention boundary; it does not claim to observe or cap private reqwest/hyper socket buffers or allocations that may occur while response headers are produced. The focused oversized-frame test proves the collector retains zero bytes from a frame larger than 16 KiB and that an oversized declared loopback response yields no parsed capability facts.
+Reqwest exposes already-materialized `Bytes` frames and does not provide a caller-sized read API for `Response::chunk()`. CSSwitch therefore enforces the strict bound across its retained input, pinned parser scratch allowance, and fixed projection storage; it does not claim to observe or cap private reqwest/hyper socket buffers or allocations that may occur while response headers are produced. The focused oversized-frame test proves the collector retains zero bytes from a frame larger than 16 KiB and that an oversized declared loopback response yields no parsed capability facts.
