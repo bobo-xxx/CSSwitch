@@ -22,10 +22,10 @@ Ship a general Provider Failure Contract in CSSwitch, proven first through Codex
 - [Establish the Codex Responses Lite contract](issues/01-establish-codex-responses-lite-contract.md) — Responses Lite is a private capability surface; preserve non-retryable capability/permanent failures, bound only the evidenced transient retry set, and expose only allowlisted diagnostics.
 - [Choose the Provider Failure Contract seam](issues/02-choose-provider-contract-seam.md) — A pure Attempt Controller owns failure policy and state; Provider Route adapters retain protocol-specific normalization and I/O.
 - [Prototype the Codex acceptance harness](issues/03-prototype-codex-acceptance-harness.md) — The accepted test-only real-handler harness fixes the Codex attempt, repair, replay, schema, and redaction targets that Ticket 05 must turn green.
+- [Decide the provider rollout boundary](issues/04-decide-provider-rollout-boundary.md) — Roll out in two stages: Codex first, then the shared API-key inference adapter with explicit per-route retry policies and fixture-based conformance.
 
 ## Not yet specified
 
-- Provider-family rollout beyond the first Codex proof; the exact boundary depends on what the capability and transport prototypes reveal.
 - Long-context and compaction recovery beyond safe request normalization; the correct boundary depends on the verified failure taxonomy.
 - Upstream publication form and reviewer evidence; the exact handoff depends on repository permissions and the final diff.
 
