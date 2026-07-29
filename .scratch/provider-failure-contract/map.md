@@ -23,6 +23,7 @@ Ship a general Provider Failure Contract in CSSwitch, proven first through Codex
 - [Choose the Provider Failure Contract seam](issues/02-choose-provider-contract-seam.md) — A pure Attempt Controller owns failure policy and state; Provider Route adapters retain protocol-specific normalization and I/O.
 - [Prototype the Codex acceptance harness](issues/03-prototype-codex-acceptance-harness.md) — The accepted test-only real-handler harness fixes the Codex attempt, repair, replay, schema, and redaction targets that Ticket 05 must turn green.
 - [Decide the provider rollout boundary](issues/04-decide-provider-rollout-boundary.md) — Roll out in two stages: Codex first, then the shared API-key inference adapter with explicit per-route retry policies and fixture-based conformance.
+- [Implement the Codex-first contract slice](issues/05-implement-codex-first-slice.md) — The reviewed and published feature branch resolves the deterministic Codex Provider Failure Contract with 8/8 harness and 27/27 contract tests; installed/live verification remains Ticket 06, and the shared API-key Provider Route adapter remains Ticket 07.
 
 ## Not yet specified
 
