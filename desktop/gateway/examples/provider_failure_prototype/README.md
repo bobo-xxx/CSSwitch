@@ -13,3 +13,20 @@ cargo run --offline --manifest-path desktop/gateway/Cargo.toml --example provide
 ```
 
 The prototype is in-memory only. It performs no network, OAuth, proxy, or filesystem-persistence operations.
+
+## Actions
+
+- `p`: begin a POST attempt
+- `b`: mark response bytes as started
+- `1`: non-equivalent capability rejection
+- `2`: HTTP 401 authentication rejection
+- `3`: HTTP 403 authorization rejection
+- `4`: rate-limited HTTP 429 with a 1500 ms Retry-After
+- `5`: quota HTTP 429
+- `6`: network failure
+- `7`: upstream HTTP 500
+- `8`: allowlisted Safe Repair observation
+- `9`: unrepairable protocol failure
+- `c`: cancellation
+- `r`: reset in-memory state
+- `q`: quit
