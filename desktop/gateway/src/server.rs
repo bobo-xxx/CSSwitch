@@ -1271,17 +1271,29 @@ fn handle_codex_messages_with_policy_and_runtime(
                             controller
                                 .observe(crate::provider_failure::FailureObservation::Cancelled)
                                 .expect("cancellation is terminal");
-                            hooks.runtime.emit(controller.cancelled_diagnostic());
+                            hooks.runtime.emit(
+                                controller
+                                    .cancelled_diagnostic()
+                                    .expect("cancelled attempt finalizes exactly once"),
+                            );
                             return;
                         }
                     }
                     crate::provider_failure::AttemptDirective::Fail(failure) => {
-                        hooks.runtime.emit(controller.failed_diagnostic(&failure));
+                        hooks.runtime.emit(
+                            controller
+                                .failed_diagnostic(&failure)
+                                .expect("failed attempt finalizes exactly once"),
+                        );
                         write_provider_failure(stream, &failure);
                         return;
                     }
                     crate::provider_failure::AttemptDirective::Cancel => {
-                        hooks.runtime.emit(controller.cancelled_diagnostic());
+                        hooks.runtime.emit(
+                            controller
+                                .cancelled_diagnostic()
+                                .expect("cancelled attempt finalizes exactly once"),
+                        );
                         return;
                     }
                     crate::provider_failure::AttemptDirective::RepairOnce(
@@ -1308,8 +1320,16 @@ fn handle_codex_messages_with_policy_and_runtime(
     );
     if is_stream {
         match forward_codex_stream(stream, upstream, &mut reducer) {
-            CodexStreamOutcome::Completed => hooks.runtime.emit(controller.completed_diagnostic()),
-            CodexStreamOutcome::Cancelled => hooks.runtime.emit(controller.cancelled_diagnostic()),
+            CodexStreamOutcome::Completed => hooks.runtime.emit(
+                controller
+                    .completed_diagnostic()
+                    .expect("completed attempt finalizes exactly once"),
+            ),
+            CodexStreamOutcome::Cancelled => hooks.runtime.emit(
+                controller
+                    .cancelled_diagnostic()
+                    .expect("cancelled attempt finalizes exactly once"),
+            ),
             CodexStreamOutcome::Failed => {
                 let directive = controller
                     .observe(crate::provider_failure::FailureObservation::Protocol(
@@ -1319,14 +1339,20 @@ fn handle_codex_messages_with_policy_and_runtime(
                 let crate::provider_failure::AttemptDirective::Fail(failure) = directive else {
                     panic!("response-started failure cannot replay");
                 };
-                hooks.runtime.emit(controller.failed_diagnostic(&failure));
+                hooks.runtime.emit(
+                    controller
+                        .failed_diagnostic(&failure)
+                        .expect("failed attempt finalizes exactly once"),
+                );
             }
         }
     } else {
         match collect_codex_nonstream(upstream, stream, &mut reducer) {
-            Err(CodexNonstreamError::DownstreamClosed) => {
-                hooks.runtime.emit(controller.cancelled_diagnostic())
-            }
+            Err(CodexNonstreamError::DownstreamClosed) => hooks.runtime.emit(
+                controller
+                    .cancelled_diagnostic()
+                    .expect("cancelled attempt finalizes exactly once"),
+            ),
             Err(CodexNonstreamError::UpstreamRead | CodexNonstreamError::Protocol) => {
                 let directive = controller
                     .observe(crate::provider_failure::FailureObservation::Protocol(
@@ -1336,13 +1362,21 @@ fn handle_codex_messages_with_policy_and_runtime(
                 let crate::provider_failure::AttemptDirective::Fail(failure) = directive else {
                     panic!("response-started failure cannot replay");
                 };
-                hooks.runtime.emit(controller.failed_diagnostic(&failure));
+                hooks.runtime.emit(
+                    controller
+                        .failed_diagnostic(&failure)
+                        .expect("failed attempt finalizes exactly once"),
+                );
                 write_provider_failure(stream, &failure);
             }
             Ok(()) => match reducer.nonstream_response() {
                 Ok(response) => {
                     write_json(stream, 200, "OK", response);
-                    hooks.runtime.emit(controller.completed_diagnostic());
+                    hooks.runtime.emit(
+                        controller
+                            .completed_diagnostic()
+                            .expect("completed attempt finalizes exactly once"),
+                    );
                 }
                 Err(_) => {
                     let directive = controller
@@ -1353,7 +1387,11 @@ fn handle_codex_messages_with_policy_and_runtime(
                     let crate::provider_failure::AttemptDirective::Fail(failure) = directive else {
                         panic!("response-started failure cannot replay");
                     };
-                    hooks.runtime.emit(controller.failed_diagnostic(&failure));
+                    hooks.runtime.emit(
+                        controller
+                            .failed_diagnostic(&failure)
+                            .expect("failed attempt finalizes exactly once"),
+                    );
                     write_provider_failure(stream, &failure);
                 }
             },

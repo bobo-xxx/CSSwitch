@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::fmt;
 use std::io::Read;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -6,6 +7,7 @@ use std::time::Duration;
 
 use reqwest::header::{HeaderValue, ACCEPT, AUTHORIZATION, CONTENT_TYPE, USER_AGENT};
 use reqwest::{Client, Response};
+use serde::Deserialize;
 use zeroize::Zeroizing;
 
 use crate::codex_auth::InferenceSecrets;
@@ -151,9 +153,64 @@ struct FailureBodyFacts {
     error_param: ErrorParam,
 }
 
+#[derive(Deserialize)]
+struct FailureBodyDocument<'a> {
+    #[serde(borrow, default)]
+    error: Option<FailureBodyError<'a>>,
+}
+
+#[derive(Deserialize)]
+struct FailureBodyError<'a> {
+    #[serde(rename = "type", borrow, default)]
+    kind: Option<Cow<'a, str>>,
+    #[serde(borrow, default)]
+    code: Option<Cow<'a, str>>,
+    #[serde(borrow, default)]
+    param: Option<Cow<'a, str>>,
+}
+
+const FAILURE_PARSED_STORAGE: usize =
+    std::mem::size_of::<FailureBodyDocument<'static>>() + std::mem::size_of::<FailureBodyFacts>();
+// In the worst case all three allowlisted strings contain JSON escapes and
+// serde_json must own their decoded bytes. Their combined size cannot exceed
+// the input size, so reserving a second input-sized budget keeps caller-owned
+// input plus parsed storage within FAILURE_BODY_LIMIT.
+const FAILURE_BODY_INPUT_LIMIT: usize = (FAILURE_BODY_LIMIT - FAILURE_PARSED_STORAGE) / 2;
+
+struct FailureBodyCollector {
+    body: Vec<u8>,
+    declared_length: usize,
+}
+
+impl FailureBodyCollector {
+    fn new(declared_length: Option<u64>) -> Option<Self> {
+        let declared_length = usize::try_from(declared_length?).ok()?;
+        (declared_length <= FAILURE_BODY_INPUT_LIMIT).then(|| Self {
+            body: Vec::with_capacity(declared_length),
+            declared_length,
+        })
+    }
+
+    fn remaining(&self) -> usize {
+        self.declared_length.saturating_sub(self.body.len())
+    }
+
+    fn retain(&mut self, chunk: &[u8]) -> bool {
+        if chunk.len() > self.remaining() {
+            return false;
+        }
+        self.body.extend_from_slice(chunk);
+        true
+    }
+
+    fn facts(self) -> FailureBodyFacts {
+        reduce_failure_body(&self.body)
+    }
+}
+
 fn reduce_failure_body(body: &[u8]) -> FailureBodyFacts {
-    let bounded = &body[..body.len().min(FAILURE_BODY_LIMIT)];
-    let parsed: serde_json::Value = match serde_json::from_slice(bounded) {
+    let bounded = &body[..body.len().min(FAILURE_BODY_INPUT_LIMIT)];
+    let parsed: FailureBodyDocument<'_> = match serde_json::from_slice(bounded) {
         Ok(value) => value,
         Err(_) => {
             return FailureBodyFacts {
@@ -163,10 +220,10 @@ fn reduce_failure_body(body: &[u8]) -> FailureBodyFacts {
             };
         }
     };
-    let error = &parsed["error"];
-    let error_type = error["type"].as_str();
-    let code = error["code"].as_str();
-    let param = error["param"].as_str();
+    let error = parsed.error;
+    let error_type = error.as_ref().and_then(|value| value.kind.as_deref());
+    let code = error.as_ref().and_then(|value| value.code.as_deref());
+    let param = error.as_ref().and_then(|value| value.param.as_deref());
     let quota = error_type == Some("insufficient_quota") || code == Some("insufficient_quota");
     let rate = error_type == Some("rate_limit_error") || code == Some("rate_limit_exceeded");
     FailureBodyFacts {
@@ -458,41 +515,59 @@ impl CodexTransport {
             .and_then(|value| parse_request_id(Some(value)));
         if !response.status().is_success() {
             enum BodyRead {
-                Body(Vec<u8>),
+                Facts(FailureBodyFacts),
                 Cancelled,
                 Unavailable,
             }
-            let cancellation_for_body = cancellation.clone();
-            let body_read = runtime.block_on(async {
-                match tokio::time::timeout(self.request_timeout, async {
-                    let mut bounded = Vec::with_capacity(FAILURE_BODY_LIMIT);
-                    while bounded.len() < FAILURE_BODY_LIMIT {
-                        let next = tokio::select! {
-                            _ = wait_for_cancel(cancellation_for_body.clone()) => {
-                                return BodyRead::Cancelled;
+            // Reqwest exposes already-framed `Bytes`; it cannot accept a caller-sized
+            // read buffer. Therefore an unknown or oversized failure body is never
+            // polled. For an admitted response, hyper's validated Content-Length
+            // bounds every materialized frame plus previously retained input.
+            let body_read = match FailureBodyCollector::new(response.content_length()) {
+                Some(mut collector) => {
+                    let cancellation_for_body = cancellation.clone();
+                    runtime.block_on(async {
+                        match tokio::time::timeout(self.request_timeout, async {
+                            while collector.remaining() > 0 {
+                                let next = tokio::select! {
+                                    _ = wait_for_cancel(cancellation_for_body.clone()) => {
+                                        return BodyRead::Cancelled;
+                                    }
+                                    next = response.chunk() => match next {
+                                        Ok(next) => next,
+                                        Err(_) => return BodyRead::Unavailable,
+                                    },
+                                };
+                                let Some(chunk) = next else {
+                                    break;
+                                };
+                                if !collector.retain(&chunk) {
+                                    return BodyRead::Unavailable;
+                                }
                             }
-                            next = response.chunk() => match next {
-                                Ok(next) => next,
-                                Err(_) => return BodyRead::Unavailable,
-                            },
-                        };
-                        let Some(chunk) = next else {
-                            break;
-                        };
-                        let remaining = FAILURE_BODY_LIMIT - bounded.len();
-                        bounded.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
-                    }
-                    BodyRead::Body(bounded)
-                })
-                .await
-                {
-                    Ok(result) => result,
-                    Err(_) => BodyRead::Unavailable,
+                            BodyRead::Facts(collector.facts())
+                        })
+                        .await
+                        {
+                            Ok(result) => result,
+                            Err(_) => BodyRead::Unavailable,
+                        }
+                    })
                 }
-            });
-            let body = match body_read {
-                BodyRead::Body(body) => body,
-                BodyRead::Unavailable => Vec::new(),
+                None if cancellation.is_cancelled() => BodyRead::Cancelled,
+                None => BodyRead::Facts(FailureBodyFacts {
+                    rate_kind: None,
+                    error_code: ErrorCode::Absent,
+                    error_param: ErrorParam::Absent,
+                }),
+            };
+            let facts = match body_read {
+                BodyRead::Facts(facts) => facts,
+                BodyRead::Unavailable => FailureBodyFacts {
+                    rate_kind: None,
+                    error_code: ErrorCode::Absent,
+                    error_param: ErrorParam::Absent,
+                },
                 BodyRead::Cancelled => {
                     return Err(CodexTransportError {
                         status: 499,
@@ -503,7 +578,6 @@ impl CodexTransport {
                     });
                 }
             };
-            let facts = reduce_failure_body(&body);
             let observation = FailureObservation::Http {
                 status,
                 rate_kind: facts.rate_kind,
@@ -671,7 +745,8 @@ mod tests {
 
     use super::{
         parse_request_id, parse_retry_after, reduce_failure_body, CodexCancellation,
-        CodexTransport, FAILURE_BODY_LIMIT,
+        CodexTransport, FailureBodyCollector, FAILURE_BODY_INPUT_LIMIT, FAILURE_BODY_LIMIT,
+        FAILURE_PARSED_STORAGE,
     };
     use crate::codex_auth::InferenceSecrets;
     use crate::provider_failure::{ErrorCode, ErrorParam, FailureObservation, RateKind};
@@ -1002,6 +1077,11 @@ mod tests {
             reduce_failure_body(br#"{"error":{"code":"unsupported_value","param":"tool_choice"}}"#);
         assert_eq!(exact.error_code, ErrorCode::UnsupportedValue);
         assert_eq!(exact.error_param, ErrorParam::ToolChoice);
+        let escaped = reduce_failure_body(
+            br#"{"error":{"code":"unsupported_v\u0061lue","param":"tool_cho\u0069ce"}}"#,
+        );
+        assert_eq!(escaped.error_code, ErrorCode::UnsupportedValue);
+        assert_eq!(escaped.error_param, ErrorParam::ToolChoice);
 
         for body in [
             br#"{"error":{"message":"unsupported_value tool_choice"}}"#.as_slice(),
@@ -1042,5 +1122,51 @@ mod tests {
         let facts = reduce_failure_body(&body);
         assert_eq!(facts.error_code, ErrorCode::Absent);
         assert_eq!(facts.error_param, ErrorParam::Absent);
+    }
+
+    #[test]
+    fn oversized_failure_frame_is_not_retained_or_parsed_by_the_caller() {
+        let mut body = br#"{"error":{"code":"unsupported_value","param":"tool_choice"}}"#.to_vec();
+        body.resize(FAILURE_BODY_LIMIT + 1, b' ');
+        let mut collector = FailureBodyCollector::new(Some(FAILURE_BODY_INPUT_LIMIT as u64))
+            .expect("the maximum bounded input must be admitted");
+        assert!(!collector.retain(&body));
+        assert_eq!(collector.body.len(), 0);
+        assert!(collector.body.capacity() + FAILURE_PARSED_STORAGE <= FAILURE_BODY_LIMIT);
+        assert!(FailureBodyCollector::new(Some(body.len() as u64)).is_none());
+
+        let response = format!(
+            "HTTP/1.1 400 Bad Request\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+            body.len()
+        )
+        .into_bytes()
+        .into_iter()
+        .chain(body)
+        .collect();
+        let (endpoint, request_rx, handle) = mock_server(response);
+        let transport = CodexTransport::for_test(endpoint).unwrap();
+        let error = transport
+            .open_responses(
+                &secrets(),
+                b"{}".to_vec(),
+                false,
+                CodexCancellation::default(),
+            )
+            .err()
+            .expect("synthetic oversized rejection must fail");
+
+        assert_eq!(
+            error.observation(),
+            FailureObservation::Http {
+                status: 400,
+                rate_kind: None,
+                retry_after_seconds: None,
+                request_id: None,
+                error_code: ErrorCode::Absent,
+                error_param: ErrorParam::Absent,
+            }
+        );
+        assert!(request_rx.recv().unwrap().starts_with(b"POST "));
+        handle.join().unwrap();
     }
 }

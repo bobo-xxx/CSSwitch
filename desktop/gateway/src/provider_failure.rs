@@ -450,7 +450,8 @@ enum AttemptPhase {
     RetryAuthorized,
     RepairAuthorized,
     UpstreamOpen,
-    Terminal,
+    TerminalPending(AttemptOutcome),
+    Finalized(AttemptOutcome),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -466,6 +467,7 @@ pub(crate) enum TransitionError {
     PostNotAuthorized,
     ObservationNotAuthorized,
     ResponseAlreadyStarted,
+    FinalizationNotAuthorized,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -508,33 +510,49 @@ impl AttemptController {
         }
     }
 
-    pub(crate) fn failed_diagnostic(&self, failure: &ProviderFailure) -> AttemptDiagnostic {
+    pub(crate) fn failed_diagnostic(
+        &mut self,
+        failure: &ProviderFailure,
+    ) -> Result<AttemptDiagnostic, TransitionError> {
+        if self.phase != AttemptPhase::TerminalPending(AttemptOutcome::Failed) {
+            return Err(TransitionError::FinalizationNotAuthorized);
+        }
+        self.phase = AttemptPhase::Finalized(AttemptOutcome::Failed);
         let snapshot = self.snapshot();
-        AttemptDiagnostic::failed(
+        Ok(AttemptDiagnostic::failed(
             &self.context,
             snapshot.posts,
             snapshot.repairs,
             snapshot.delays_ms,
             failure,
-        )
+        ))
     }
 
-    pub(crate) fn completed_diagnostic(&mut self) -> AttemptDiagnostic {
-        self.phase = AttemptPhase::Terminal;
-        AttemptDiagnostic::without_failure(
+    pub(crate) fn completed_diagnostic(&mut self) -> Result<AttemptDiagnostic, TransitionError> {
+        if self.phase != AttemptPhase::UpstreamOpen {
+            return Err(TransitionError::FinalizationNotAuthorized);
+        }
+        self.phase = AttemptPhase::Finalized(AttemptOutcome::Completed);
+        Ok(AttemptDiagnostic::without_failure(
             AttemptOutcome::Completed,
             &self.context,
             self.snapshot(),
-        )
+        ))
     }
 
-    pub(crate) fn cancelled_diagnostic(&mut self) -> AttemptDiagnostic {
-        self.phase = AttemptPhase::Terminal;
-        AttemptDiagnostic::without_failure(
+    pub(crate) fn cancelled_diagnostic(&mut self) -> Result<AttemptDiagnostic, TransitionError> {
+        if !matches!(
+            self.phase,
+            AttemptPhase::UpstreamOpen | AttemptPhase::TerminalPending(AttemptOutcome::Cancelled)
+        ) {
+            return Err(TransitionError::FinalizationNotAuthorized);
+        }
+        self.phase = AttemptPhase::Finalized(AttemptOutcome::Cancelled);
+        Ok(AttemptDiagnostic::without_failure(
             AttemptOutcome::Cancelled,
             &self.context,
             self.snapshot(),
-        )
+        ))
     }
 
     pub(crate) fn begin_post(&mut self) -> Result<(), TransitionError> {
@@ -569,10 +587,13 @@ impl AttemptController {
         observation: FailureObservation,
     ) -> Result<AttemptDirective, TransitionError> {
         if matches!(&observation, FailureObservation::Cancelled) {
-            if self.phase == AttemptPhase::Terminal {
+            if matches!(
+                self.phase,
+                AttemptPhase::TerminalPending(_) | AttemptPhase::Finalized(_)
+            ) {
                 return Err(TransitionError::ObservationNotAuthorized);
             }
-            self.phase = AttemptPhase::Terminal;
+            self.phase = AttemptPhase::TerminalPending(AttemptOutcome::Cancelled);
             return Ok(AttemptDirective::Cancel);
         }
         if !matches!(
@@ -582,7 +603,7 @@ impl AttemptController {
             return Err(TransitionError::ObservationNotAuthorized);
         }
         if self.response_started {
-            self.phase = AttemptPhase::Terminal;
+            self.phase = AttemptPhase::TerminalPending(AttemptOutcome::Failed);
             return Ok(AttemptDirective::Fail(ProviderFailure::from_observation(
                 &self.context,
                 &observation,
@@ -653,7 +674,7 @@ impl AttemptController {
         }
 
         let exhausted = proven_rate || transient_http || transient_network;
-        self.phase = AttemptPhase::Terminal;
+        self.phase = AttemptPhase::TerminalPending(AttemptOutcome::Failed);
         Ok(AttemptDirective::Fail(ProviderFailure::from_observation(
             &self.context,
             &observation,

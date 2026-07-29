@@ -295,7 +295,7 @@ fn completed_and_cancelled_diagnostics_omit_failure_fields() {
     completed.begin_post().unwrap();
     completed.mark_response_started().unwrap();
     assert_eq!(
-        serde_json::to_value(completed.completed_diagnostic()).unwrap(),
+        serde_json::to_value(completed.completed_diagnostic().unwrap()).unwrap(),
         serde_json::json!({
             "outcome":"completed", "provider":"codex", "route":"responses",
             "correlation_id":"corr-0001", "posts":1, "repairs":0, "delays_ms":[]
@@ -306,10 +306,61 @@ fn completed_and_cancelled_diagnostics_omit_failure_fields() {
     cancelled.begin_post().unwrap();
     cancelled.observe(FailureObservation::Cancelled).unwrap();
     assert_eq!(
-        serde_json::to_value(cancelled.cancelled_diagnostic()).unwrap(),
+        serde_json::to_value(cancelled.cancelled_diagnostic().unwrap()).unwrap(),
         serde_json::json!({
             "outcome":"cancelled", "provider":"codex", "route":"responses",
             "correlation_id":"corr-0001", "posts":1, "repairs":0, "delays_ms":[]
         })
+    );
+}
+
+#[test]
+fn final_diagnostics_are_single_use_and_phase_checked() {
+    let mut failed = AttemptController::new(context(RouteMode::Responses), false);
+    failed.begin_post().unwrap();
+    let AttemptDirective::Fail(failure) = failed.observe(http(422, None, None)).unwrap() else {
+        panic!("permanent rejection must fail");
+    };
+    assert!(failed.failed_diagnostic(&failure).is_ok());
+    assert_eq!(
+        failed.failed_diagnostic(&failure),
+        Err(TransitionError::FinalizationNotAuthorized)
+    );
+    assert_eq!(
+        failed.completed_diagnostic(),
+        Err(TransitionError::FinalizationNotAuthorized)
+    );
+    assert_eq!(
+        failed.cancelled_diagnostic(),
+        Err(TransitionError::FinalizationNotAuthorized)
+    );
+
+    let mut in_flight = AttemptController::new(context(RouteMode::Responses), false);
+    in_flight.begin_post().unwrap();
+    assert_eq!(
+        in_flight.completed_diagnostic(),
+        Err(TransitionError::FinalizationNotAuthorized)
+    );
+    assert_eq!(
+        in_flight.cancelled_diagnostic(),
+        Err(TransitionError::FinalizationNotAuthorized)
+    );
+
+    let mut completed = AttemptController::new(context(RouteMode::Responses), false);
+    completed.begin_post().unwrap();
+    completed.mark_response_started().unwrap();
+    assert!(completed.completed_diagnostic().is_ok());
+    assert_eq!(
+        completed.completed_diagnostic(),
+        Err(TransitionError::FinalizationNotAuthorized)
+    );
+
+    let mut cancelled = AttemptController::new(context(RouteMode::Responses), false);
+    cancelled.begin_post().unwrap();
+    cancelled.observe(FailureObservation::Cancelled).unwrap();
+    assert!(cancelled.cancelled_diagnostic().is_ok());
+    assert_eq!(
+        cancelled.cancelled_diagnostic(),
+        Err(TransitionError::FinalizationNotAuthorized)
     );
 }
