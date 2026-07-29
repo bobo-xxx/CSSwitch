@@ -1,7 +1,7 @@
 # Choose the Provider Failure Contract seam
 
 Type: prototype
-Status: open
+Status: claimed
 Blocked by: 01
 
 ## Question
