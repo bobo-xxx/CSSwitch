@@ -1215,6 +1215,7 @@ fn assert_safe_repair(choice: Option<Value>) {
     );
     assert!(!second.contains_key("tool_choice"));
     assert_eq!(first, second);
+    assert!(result.delays_ms.is_empty());
 }
 
 #[test]
@@ -1317,6 +1318,7 @@ fn contract_used_repair_budget_stops_after_second_typed_rejection() {
     );
     assert!(!second.contains_key("tool_choice"));
     assert_eq!(first, second);
+    assert!(result.delays_ms.is_empty());
     assert_failure_envelope(
         &result,
         400,

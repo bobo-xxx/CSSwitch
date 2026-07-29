@@ -1075,6 +1075,14 @@ struct CodexRequestPolicy<'a> {
     use_responses_lite: bool,
 }
 
+fn caller_allows_automatic_tool_choice(raw: &Value) -> bool {
+    match raw.get("tool_choice") {
+        None => true,
+        Some(Value::Object(choice)) => choice.get("type").and_then(Value::as_str) == Some("auto"),
+        Some(_) => false,
+    }
+}
+
 static CODEX_CORRELATION_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 fn next_codex_correlation_id() -> crate::provider_failure::CorrelationId {
@@ -1177,7 +1185,7 @@ fn handle_codex_messages_with_policy_and_runtime(
         supports_parallel_tool_calls: policy.supports_parallel_tool_calls,
         use_responses_lite: policy.use_responses_lite,
     };
-    let translated = match codex_protocol::translate_anthropic_request(raw, &context, &signer) {
+    let mut translated = match codex_protocol::translate_anthropic_request(raw, &context, &signer) {
         Ok(translated) => translated,
         Err(error) => {
             if error.kind == codex_protocol::ProtocolErrorKind::Bounds {
@@ -1188,6 +1196,9 @@ fn handle_codex_messages_with_policy_and_runtime(
             return;
         }
     };
+    let repair_enabled = policy.use_responses_lite
+        && caller_allows_automatic_tool_choice(raw)
+        && translated.get("tool_choice").and_then(Value::as_str) == Some("auto");
     let route = if policy.use_responses_lite {
         crate::provider_failure::RouteMode::ResponsesLite
     } else {
@@ -1195,7 +1206,8 @@ fn handle_codex_messages_with_policy_and_runtime(
     };
     let route_context =
         crate::provider_failure::RouteContext::codex(route, next_codex_correlation_id());
-    let mut controller = crate::provider_failure::AttemptController::new(route_context, false);
+    let mut controller =
+        crate::provider_failure::AttemptController::new(route_context, repair_enabled);
     let generation = secrets.auth_generation();
     let cancellation = codex_transport::CodexCancellation::default();
     let _cancellation_watch = match DownstreamCancellationWatch::start(stream, cancellation.clone())
@@ -1251,9 +1263,17 @@ fn handle_codex_messages_with_policy_and_runtime(
                         return;
                     }
                     crate::provider_failure::AttemptDirective::Cancel => return,
-                    crate::provider_failure::AttemptDirective::RepairOnce(_) => {
-                        api_error_json(stream, 500, "Codex repair runtime is not installed");
-                        return;
+                    crate::provider_failure::AttemptDirective::RepairOnce(
+                        crate::provider_failure::RepairKind::OmitAutomaticToolChoice,
+                    ) => {
+                        let removed = translated
+                            .as_object_mut()
+                            .and_then(|object| object.remove("tool_choice"));
+                        assert_eq!(
+                            removed,
+                            Some(Value::String("auto".to_owned())),
+                            "controller may authorize only the exact top-level automatic tool choice repair"
+                        );
                     }
                 }
             }
@@ -2329,9 +2349,10 @@ mod tests {
         write_bridge_response_once, write_bridge_status, BridgeProgress,
     };
     use super::{
-        apply_dsml_nonstream, collect_codex_nonstream, dsml_stream_filter, forward_stream_body,
-        handle_codex_messages_with_catalog, handle_codex_messages_with_secrets, handle_post,
-        map_codex_auth_error, openai_chat_reasoning_signer, pump_codex_stream, stream_error_event,
+        apply_dsml_nonstream, caller_allows_automatic_tool_choice, collect_codex_nonstream,
+        dsml_stream_filter, forward_stream_body, handle_codex_messages_with_catalog,
+        handle_codex_messages_with_secrets, handle_post, map_codex_auth_error,
+        openai_chat_reasoning_signer, pump_codex_stream, stream_error_event,
         write_codex_models_response, CodexComponents, CodexNonstreamError, CodexPumpError,
         KimiServerToolFilter, ProductionCodexAttemptRuntime, RequestHead, RequestNonceGenerator,
         StreamFilter, StreamTermination,
@@ -2345,6 +2366,22 @@ mod tests {
     use crate::models::RelayModelCache;
 
     struct FailingReader;
+
+    #[test]
+    fn safe_repair_caller_eligibility_is_closed_to_absent_or_auto() {
+        assert!(caller_allows_automatic_tool_choice(&serde_json::json!({})));
+        assert!(caller_allows_automatic_tool_choice(
+            &serde_json::json!({"tool_choice":{"type":"auto"}})
+        ));
+        for request in [
+            serde_json::json!({"tool_choice":{"type":"none"}}),
+            serde_json::json!({"tool_choice":{"type":"any"}}),
+            serde_json::json!({"tool_choice":{"type":"tool","name":"read"}}),
+            serde_json::json!({"tool_choice":"auto"}),
+        ] {
+            assert!(!caller_allows_automatic_tool_choice(&request));
+        }
+    }
 
     #[test]
     fn production_codex_retry_wait_observes_existing_cancellation() {
