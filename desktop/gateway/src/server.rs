@@ -1075,6 +1075,26 @@ struct CodexRequestPolicy<'a> {
     use_responses_lite: bool,
 }
 
+static CODEX_CORRELATION_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+fn next_codex_correlation_id() -> crate::provider_failure::CorrelationId {
+    let sequence = CODEX_CORRELATION_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    crate::provider_failure::CorrelationId::new(format!("codex-{sequence:016x}"))
+        .expect("generated Codex correlation ID is allowlisted")
+}
+
+fn write_provider_failure(
+    stream: &mut TcpStream,
+    failure: &crate::provider_failure::ProviderFailure,
+) {
+    write_json(
+        stream,
+        failure.status(),
+        status_reason(failure.status()),
+        failure.anthropic_json(),
+    );
+}
+
 fn handle_codex_messages_with_policy(
     stream: &mut TcpStream,
     raw: &Value,
@@ -1118,6 +1138,14 @@ fn handle_codex_messages_with_policy(
             return;
         }
     };
+    let route = if policy.use_responses_lite {
+        crate::provider_failure::RouteMode::ResponsesLite
+    } else {
+        crate::provider_failure::RouteMode::Responses
+    };
+    let route_context =
+        crate::provider_failure::RouteContext::codex(route, next_codex_correlation_id());
+    let mut controller = crate::provider_failure::AttemptController::new(route_context, false);
     let body = match serde_json::to_vec(&translated) {
         Ok(body) => body,
         Err(_) => {
@@ -1135,18 +1163,35 @@ fn handle_codex_messages_with_policy(
             return;
         }
     };
+    controller
+        .begin_post()
+        .expect("initial Codex POST is authorized");
     let upstream =
         match transport.open_responses(&secrets, body, policy.use_responses_lite, cancellation) {
             Ok(upstream) => upstream,
             Err(error) => {
-                if error.cancelled {
-                    return;
-                }
+                let observation = error.observation();
                 if let Some(status @ (401 | 403)) = error.upstream_status {
                     auth_rejected(status, generation);
                 }
-                api_error_json(stream, error.status, error.detail);
-                return;
+                match controller
+                    .observe(observation)
+                    .expect("in-flight Codex observation is authorized")
+                {
+                    crate::provider_failure::AttemptDirective::Fail(failure) => {
+                        write_provider_failure(stream, &failure);
+                        return;
+                    }
+                    crate::provider_failure::AttemptDirective::Cancel => return,
+                    crate::provider_failure::AttemptDirective::RetryAfter(_) => {
+                        api_error_json(stream, 500, "Codex retry runtime is not installed");
+                        return;
+                    }
+                    crate::provider_failure::AttemptDirective::RepairOnce(_) => {
+                        api_error_json(stream, 500, "Codex repair runtime is not installed");
+                        return;
+                    }
+                }
             }
         };
     let mut reducer = codex_protocol::ResponsesReducer::new(
