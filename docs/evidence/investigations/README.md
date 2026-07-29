@@ -18,5 +18,6 @@
   - [UI / 覆盖安装 Acceptance](2026-07-18-v070-model-catalog-ui-acceptance-review.md)
   - [真实 Science alias Stage 0](2026-07-18-v070-model-catalog-stage0.md)
 - [2026-07-29 Codex Acceptance Harness Expected-Red Audit](2026-07-29-codex-acceptance-harness-expected-red.md)
+- [2026-07-29 Codex Provider Failure Contract implementation evidence](2026-07-29-codex-provider-failure-implementation.md)
 
 调查结论绑定日期、上游版本和环境。需要稳定合同请回到[架构](../../architecture/README.md)或[功能文档](../../features/README.md)。
