@@ -8,6 +8,55 @@ use std::time::Duration;
 
 use serde_json::Value;
 
+use super::{handle_codex_messages_with_policy, CodexRequestPolicy};
+use crate::codex_auth::InferenceSecrets;
+use crate::codex_transport::CodexTransport;
+
+const ACCESS_SENTINEL: &str = "ACCEPTANCE_ACCESS_TOKEN_SENTINEL";
+const ACCOUNT_SENTINEL: &str = "ACCEPTANCE_ACCOUNT_SENTINEL";
+
+struct AcceptanceCase {
+    request: Value,
+    is_stream: bool,
+    use_responses_lite: bool,
+    endpoint_path: &'static str,
+    steps: Vec<UpstreamStep>,
+}
+
+struct AcceptanceResult {
+    downstream: Vec<u8>,
+    script: ScriptResult,
+    auth_rejections: Vec<u16>,
+}
+
+impl AcceptanceResult {
+    fn status(&self) -> u16 {
+        String::from_utf8_lossy(&self.downstream)
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .and_then(|status| status.parse().ok())
+            .expect("downstream HTTP status")
+    }
+
+    fn body(&self) -> &[u8] {
+        let start = self
+            .downstream
+            .windows(4)
+            .position(|part| part == b"\r\n\r\n")
+            .expect("downstream HTTP headers");
+        &self.downstream[start + 4..]
+    }
+
+    fn json(&self) -> Value {
+        serde_json::from_slice(self.body()).expect("downstream JSON")
+    }
+
+    fn text(&self) -> String {
+        String::from_utf8_lossy(&self.downstream).into_owned()
+    }
+}
+
 #[derive(Clone, Debug)]
 enum UpstreamStep {
     Http {
@@ -295,9 +344,104 @@ fn manual_post_raw(address: SocketAddr, body: Value) -> Vec<u8> {
     response
 }
 
+fn run_case(case: AcceptanceCase) -> AcceptanceResult {
+    let upstream = ScriptedCodexUpstream::start(case.steps);
+    let transport = CodexTransport::for_test(upstream.endpoint(case.endpoint_path))
+        .expect("construct real test Codex transport");
+    let auth_rejections = Arc::new(Mutex::new(Vec::new()));
+    let auth_rejections_for_handler = Arc::clone(&auth_rejections);
+    let downstream = capture_downstream(|stream| {
+        handle_codex_messages_with_policy(
+            stream,
+            &case.request,
+            case.is_stream,
+            InferenceSecrets::for_test(ACCESS_SENTINEL, ACCOUNT_SENTINEL),
+            &transport,
+            CodexRequestPolicy {
+                use_responses_lite: case.use_responses_lite,
+                ..CodexRequestPolicy::default()
+            },
+            |status, _generation| {
+                auth_rejections_for_handler
+                    .lock()
+                    .expect("lock auth rejections")
+                    .push(status);
+            },
+        );
+    });
+    let script = upstream.finish();
+    let auth_rejections = auth_rejections
+        .lock()
+        .expect("lock final auth rejections")
+        .clone();
+    AcceptanceResult {
+        downstream,
+        script,
+        auth_rejections,
+    }
+}
+
+fn capture_downstream(handler: impl FnOnce(&mut TcpStream)) -> Vec<u8> {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind downstream capture");
+    let address = listener.local_addr().expect("read downstream address");
+    let reader = thread::spawn(move || {
+        let mut stream = TcpStream::connect(address).expect("connect downstream reader");
+        let mut response = Vec::new();
+        stream
+            .read_to_end(&mut response)
+            .expect("read downstream response");
+        response
+    });
+    let (mut stream, _) = listener.accept().expect("accept downstream reader");
+    handler(&mut stream);
+    drop(stream);
+    reader.join().expect("join downstream reader")
+}
+
+fn anthropic_request(stream: bool) -> Value {
+    serde_json::json!({
+        "model": "gpt-test",
+        "max_tokens": 128,
+        "stream": stream,
+        "messages": [{"role": "user", "content": "hello"}]
+    })
+}
+
+fn complete_sse() -> Vec<u8> {
+    [
+        serde_json::json!({"type":"response.created","response":{"id":"resp"}}),
+        serde_json::json!({"type":"response.output_text.delta","item_id":"msg","delta":"hello"}),
+        serde_json::json!({"type":"response.output_item.done","item":{"type":"message","id":"msg","content":[{"type":"output_text","text":"hello"}]}}),
+        serde_json::json!({"type":"response.completed","response":{"usage":{"input_tokens":2,"output_tokens":1}}}),
+    ]
+    .into_iter()
+    .map(|event| format!("data: {event}\n\n"))
+    .collect::<String>()
+    .into_bytes()
+}
+
 #[test]
 fn harness_feature_gate_compiles() {
     assert!(cfg!(all(test, feature = "acceptance-build")));
+}
+
+#[test]
+fn harness_runner_uses_real_handler_and_transport() {
+    let result = run_case(AcceptanceCase {
+        request: anthropic_request(false),
+        is_stream: false,
+        use_responses_lite: false,
+        endpoint_path: "/responses",
+        steps: vec![UpstreamStep::Sse(complete_sse())],
+    });
+
+    assert_eq!(result.status(), 200);
+    assert_eq!(result.script.requests.len(), 1);
+    assert_eq!(result.script.remaining_steps, 0);
+    assert_eq!(result.script.requests[0].body["model"], "gpt-test");
+    assert_eq!(result.json()["content"][0]["text"], "hello");
+    assert!(result.auth_rejections.is_empty());
+    assert!(result.text().starts_with("HTTP/1.1 200"));
 }
 
 #[test]
