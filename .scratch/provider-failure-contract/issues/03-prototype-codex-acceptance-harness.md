@@ -1,7 +1,7 @@
 # Prototype the Codex acceptance harness
 
 Type: prototype
-Status: open
+Status: claimed
 Blocked by: 01
 
 ## Question
