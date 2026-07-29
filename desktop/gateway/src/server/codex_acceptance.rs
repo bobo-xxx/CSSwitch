@@ -57,6 +57,39 @@ impl AcceptanceResult {
     }
 }
 
+fn assert_failure_envelope(
+    result: &AcceptanceResult,
+    status: u16,
+    error_type: &str,
+    route: &str,
+    failure_class: &str,
+    upstream_status: Option<u16>,
+    retryable: bool,
+) {
+    assert_eq!(result.status(), status);
+    let body = result.json();
+    assert_eq!(body["type"], "error");
+    assert_eq!(body["error"]["type"], error_type);
+    assert!(body["error"]["message"]
+        .as_str()
+        .is_some_and(|value| !value.is_empty()));
+    assert_eq!(body["error"]["provider"], "codex");
+    assert_eq!(body["error"]["route"], route);
+    assert_eq!(body["error"]["failure_class"], failure_class);
+    assert_eq!(
+        body["error"]["upstream_status"].as_u64(),
+        upstream_status.map(u64::from)
+    );
+    assert_eq!(body["error"]["retryable"], retryable);
+    assert!(body["error"]["correlation_id"]
+        .as_str()
+        .is_some_and(|value| !value.is_empty()));
+    assert!(body["error"]["recovery"]
+        .as_str()
+        .is_some_and(|value| !value.is_empty()));
+    assert!(body["error"].get("attempt_count").is_none());
+}
+
 #[derive(Clone, Debug)]
 enum UpstreamStep {
     Http {
@@ -407,6 +440,19 @@ fn anthropic_request(stream: bool) -> Value {
     })
 }
 
+fn tool_request(choice: Option<Value>) -> Value {
+    let mut request = anthropic_request(false);
+    request["tools"] = serde_json::json!([{
+        "name": "read",
+        "description": "read a synthetic file",
+        "input_schema": {"type": "object", "properties": {}}
+    }]);
+    if let Some(choice) = choice {
+        request["tool_choice"] = choice;
+    }
+    request
+}
+
 fn complete_sse() -> Vec<u8> {
     [
         serde_json::json!({"type":"response.created","response":{"id":"resp"}}),
@@ -418,6 +464,110 @@ fn complete_sse() -> Vec<u8> {
     .map(|event| format!("data: {event}\n\n"))
     .collect::<String>()
     .into_bytes()
+}
+
+#[test]
+fn contract_lite_non_equivalent_tool_choices_never_post() {
+    for choice in [
+        serde_json::json!({"type": "none"}),
+        serde_json::json!({"type": "any"}),
+        serde_json::json!({"type": "required"}),
+        serde_json::json!({"type": "tool", "name": "read"}),
+    ] {
+        let result = run_case(AcceptanceCase {
+            request: tool_request(Some(choice)),
+            is_stream: false,
+            use_responses_lite: true,
+            endpoint_path: "/responses",
+            steps: Vec::new(),
+        });
+        assert_eq!(result.status(), 400);
+        assert_eq!(result.json()["error"]["type"], "invalid_request_error");
+        assert_eq!(result.script.requests.len(), 0);
+        assert_eq!(result.script.remaining_steps, 0);
+        assert_eq!(result.script.unexpected_posts, 0);
+    }
+}
+
+fn assert_permanent_4xx(status: u16, reason: &'static str) {
+    let result = run_case(AcceptanceCase {
+        request: anthropic_request(false),
+        is_stream: false,
+        use_responses_lite: false,
+        endpoint_path: "/responses",
+        steps: vec![UpstreamStep::json(
+            status,
+            reason,
+            serde_json::json!({"error":{"type":"invalid_request_error","code":"invalid_request"}}),
+        )],
+    });
+    assert_eq!(result.script.requests.len(), 1);
+    assert_eq!(result.script.remaining_steps, 0);
+    assert_eq!(result.script.unexpected_posts, 0);
+    assert_failure_envelope(
+        &result,
+        status,
+        "invalid_request_error",
+        "responses",
+        "invalid_request",
+        Some(status),
+        false,
+    );
+}
+
+#[test]
+fn contract_permanent_400_is_not_retried() {
+    assert_permanent_4xx(400, "Bad Request");
+}
+
+#[test]
+fn contract_permanent_404_is_not_retried() {
+    assert_permanent_4xx(404, "Not Found");
+}
+
+#[test]
+fn contract_permanent_422_is_not_retried() {
+    assert_permanent_4xx(422, "Unprocessable Entity");
+}
+
+fn assert_auth_failure(status: u16, reason: &'static str, error_type: &str, failure_class: &str) {
+    let result = run_case(AcceptanceCase {
+        request: anthropic_request(false),
+        is_stream: false,
+        use_responses_lite: false,
+        endpoint_path: "/responses",
+        steps: vec![UpstreamStep::json(
+            status,
+            reason,
+            serde_json::json!({"error":{"code":"synthetic_auth_rejection"}}),
+        )],
+    });
+    assert_eq!(result.script.requests.len(), 1);
+    assert_eq!(result.auth_rejections, vec![status]);
+    assert_failure_envelope(
+        &result,
+        status,
+        error_type,
+        "responses",
+        failure_class,
+        Some(status),
+        false,
+    );
+}
+
+#[test]
+fn contract_401_is_authentication_and_not_retried() {
+    assert_auth_failure(
+        401,
+        "Unauthorized",
+        "authentication_error",
+        "authentication",
+    );
+}
+
+#[test]
+fn contract_403_is_authorization_and_not_retried() {
+    assert_auth_failure(403, "Forbidden", "permission_error", "authorization");
 }
 
 #[test]
