@@ -466,6 +466,166 @@ fn complete_sse() -> Vec<u8> {
     .into_bytes()
 }
 
+fn rate_limit_step(retry_after: &str, request_id: Option<&str>) -> UpstreamStep {
+    let mut headers = vec![("Retry-After", retry_after)];
+    if let Some(request_id) = request_id {
+        headers.push(("x-request-id", request_id));
+    }
+    UpstreamStep::json_with_headers(
+        429,
+        "Too Many Requests",
+        serde_json::json!({"error":{"type":"rate_limit_error","code":"rate_limit_exceeded"}}),
+        headers,
+    )
+}
+
+#[test]
+fn contract_rate_limit_retries_twice_then_succeeds() {
+    let result = run_case(AcceptanceCase {
+        request: anthropic_request(false),
+        is_stream: false,
+        use_responses_lite: false,
+        endpoint_path: "/responses",
+        steps: vec![
+            rate_limit_step("0", None),
+            rate_limit_step("0", None),
+            UpstreamStep::Sse(complete_sse()),
+        ],
+    });
+    assert_eq!(result.status(), 200);
+    assert_eq!(result.script.requests.len(), 3);
+    assert_eq!(result.script.remaining_steps, 0);
+    assert_eq!(result.script.unexpected_posts, 0);
+}
+
+#[test]
+fn contract_rate_limit_exhaustion_caps_retry_after() {
+    let result = run_case(AcceptanceCase {
+        request: anthropic_request(false),
+        is_stream: false,
+        use_responses_lite: false,
+        endpoint_path: "/responses",
+        steps: vec![
+            rate_limit_step("0", None),
+            rate_limit_step("0", None),
+            rate_limit_step("120", Some("req-acceptance-429")),
+        ],
+    });
+    assert_eq!(result.script.requests.len(), 3);
+    assert_failure_envelope(
+        &result,
+        429,
+        "rate_limit_error",
+        "responses",
+        "rate_limit",
+        Some(429),
+        true,
+    );
+    let body = result.json();
+    assert_eq!(body["error"]["retry_after_seconds"], 60);
+    assert_eq!(body["error"]["request_id"], "req-acceptance-429");
+}
+
+#[test]
+fn contract_quota_429_is_not_retried() {
+    let result = run_case(AcceptanceCase {
+        request: anthropic_request(false),
+        is_stream: false,
+        use_responses_lite: false,
+        endpoint_path: "/responses",
+        steps: vec![
+            UpstreamStep::json(
+                429,
+                "Too Many Requests",
+                serde_json::json!({"error":{"type":"insufficient_quota","code":"insufficient_quota"}}),
+            ),
+            UpstreamStep::Sse(complete_sse()),
+        ],
+    });
+    assert_eq!(result.script.requests.len(), 1);
+    assert_eq!(result.script.remaining_steps, 1);
+    assert_failure_envelope(
+        &result,
+        429,
+        "rate_limit_error",
+        "responses",
+        "quota",
+        Some(429),
+        false,
+    );
+}
+
+fn transient_step(status: u16, reason: &'static str) -> UpstreamStep {
+    UpstreamStep::json_with_headers(
+        status,
+        reason,
+        serde_json::json!({"error":{"code":"synthetic_transient"}}),
+        vec![("Retry-After", "0")],
+    )
+}
+
+#[test]
+fn contract_network_and_5xx_retry_within_three_posts() {
+    let result = run_case(AcceptanceCase {
+        request: anthropic_request(false),
+        is_stream: false,
+        use_responses_lite: false,
+        endpoint_path: "/responses",
+        steps: vec![
+            UpstreamStep::Disconnect,
+            transient_step(503, "Service Unavailable"),
+            UpstreamStep::Sse(complete_sse()),
+        ],
+    });
+    assert_eq!(result.status(), 200);
+    assert_eq!(result.script.requests.len(), 3);
+    assert_eq!(result.script.remaining_steps, 0);
+}
+
+fn assert_transient_exhaustion(status: u16, reason: &'static str, downstream_status: u16) {
+    let result = run_case(AcceptanceCase {
+        request: anthropic_request(false),
+        is_stream: false,
+        use_responses_lite: false,
+        endpoint_path: "/responses",
+        steps: vec![
+            transient_step(status, reason),
+            transient_step(status, reason),
+            transient_step(status, reason),
+        ],
+    });
+    assert_eq!(result.script.requests.len(), 3);
+    assert_failure_envelope(
+        &result,
+        downstream_status,
+        "api_error",
+        "responses",
+        "transient",
+        Some(status),
+        true,
+    );
+}
+
+#[test]
+fn contract_408_exhaustion_returns_504() {
+    assert_transient_exhaustion(408, "Request Timeout", 504);
+}
+
+#[test]
+fn contract_409_exhaustion_returns_502() {
+    assert_transient_exhaustion(409, "Conflict", 502);
+}
+
+#[test]
+fn contract_500_exhaustion_returns_502() {
+    assert_transient_exhaustion(500, "Internal Server Error", 502);
+}
+
+#[test]
+fn contract_503_exhaustion_returns_502() {
+    assert_transient_exhaustion(503, "Service Unavailable", 502);
+}
+
 #[test]
 fn contract_lite_non_equivalent_tool_choices_never_post() {
     for choice in [
