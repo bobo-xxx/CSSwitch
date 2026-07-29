@@ -33,8 +33,10 @@ The prototype is in-memory only. It performs no network, OAuth, proxy, or filesy
 - `r`: reset in-memory state
 - `q`: quit
 
-## Validation state
+## Verdict
 
-Decision: pending re-validation
+Decision: accepted
 
-The previous acceptance predates the typed attempt-authorization and forbidden-data hardening. Final review must re-drive the documented scenarios before deciding whether to accept the seam.
+The user validated the hardened pure Attempt Controller seam after driving the original failure-policy scenarios and the phase-authorization, cancellation-finality, structural-redaction, repair-scoping, and HTTP 408/409 edge scenarios.
+
+Observation: The controller centralizes policy, state, and attempt authorization without taking Provider Route I/O away from adapters.
