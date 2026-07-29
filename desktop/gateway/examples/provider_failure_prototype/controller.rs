@@ -171,6 +171,12 @@ pub struct ProviderFailure {
 }
 
 impl ProviderFailure {
+    // The terminal shell renders JSON but does not execute the adapter's HTTP response write.
+    #[allow(dead_code)]
+    pub fn status(&self) -> u16 {
+        self.status
+    }
+
     pub fn anthropic_json(&self) -> Value {
         let mut error = json!({
             "type": self.error_type,
@@ -334,10 +340,7 @@ impl AttemptController {
             FailureObservation::Http { .. }
             | FailureObservation::Network
             | FailureObservation::Protocol(_) => self.state.phase == AttemptPhase::InFlight,
-            FailureObservation::Cancelled => matches!(
-                self.state.phase,
-                AttemptPhase::ReadyInitial | AttemptPhase::InFlight
-            ),
+            FailureObservation::Cancelled => self.state.phase != AttemptPhase::Terminal,
         }
     }
 
