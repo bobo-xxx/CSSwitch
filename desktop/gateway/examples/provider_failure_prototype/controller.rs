@@ -1,15 +1,54 @@
 use serde_json::{json, Value};
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RetryPolicy {
-    pub max_posts: u8,
-    pub base_delay_ms: u64,
-    pub max_delay_ms: u64,
-    pub retry_after_cap_ms: u64,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProviderId {
+    Codex,
 }
 
-impl Default for RetryPolicy {
-    fn default() -> Self {
+impl ProviderId {
+    fn safe_label(self) -> &'static str {
+        match self {
+            Self::Codex => "codex",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RouteMode {
+    ResponsesLite,
+}
+
+impl RouteMode {
+    fn safe_label(self) -> &'static str {
+        match self {
+            Self::ResponsesLite => "responses_lite",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CorrelationId {
+    Prototype0001,
+}
+
+impl CorrelationId {
+    fn safe_label(self) -> &'static str {
+        match self {
+            Self::Prototype0001 => "prototype-0001",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RetryPolicy {
+    max_posts: u8,
+    base_delay_ms: u64,
+    max_delay_ms: u64,
+    retry_after_cap_ms: u64,
+}
+
+impl RetryPolicy {
+    fn prototype() -> Self {
         Self {
             max_posts: 3,
             base_delay_ms: 500,
@@ -19,19 +58,23 @@ impl Default for RetryPolicy {
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct AttemptState {
-    pub posts_started: u8,
-    pub repairs_used: u8,
-    pub response_started: bool,
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RouteContext {
-    pub provider: String,
-    pub route: String,
-    pub correlation_id: String,
-    pub policy: RetryPolicy,
+    provider: ProviderId,
+    route: RouteMode,
+    correlation_id: CorrelationId,
+    policy: RetryPolicy,
+}
+
+impl RouteContext {
+    pub fn codex_responses_lite_prototype() -> Self {
+        Self {
+            provider: ProviderId::Codex,
+            route: RouteMode::ResponsesLite,
+            correlation_id: CorrelationId::Prototype0001,
+            policy: RetryPolicy::prototype(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -45,36 +88,86 @@ pub enum RepairKind {
     OmitUnsupportedAutomaticToolChoice,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProtocolClass {
+    UnsupportedAutomaticToolChoice,
+    InvalidResponse,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FailureObservation {
-    Capability {
-        repair: Option<RepairKind>,
-    },
+    Capability,
     Http {
         status: u16,
         rate_kind: Option<RateKind>,
         retry_after_ms: Option<u64>,
-        repair: Option<RepairKind>,
     },
     Network,
-    Protocol {
-        repair: Option<RepairKind>,
-    },
+    Protocol(ProtocolClass),
     Cancelled,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ObservationKind {
+    Capability,
+    Http,
+    Network,
+    Protocol,
+    Cancelled,
+}
+
+impl FailureObservation {
+    fn kind(&self) -> ObservationKind {
+        match self {
+            Self::Capability => ObservationKind::Capability,
+            Self::Http { .. } => ObservationKind::Http,
+            Self::Network => ObservationKind::Network,
+            Self::Protocol(_) => ObservationKind::Protocol,
+            Self::Cancelled => ObservationKind::Cancelled,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AttemptPhase {
+    ReadyInitial,
+    InFlight,
+    RetryAuthorized,
+    RepairAuthorized(RepairKind),
+    Terminal,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AttemptState {
+    posts_started: u8,
+    repairs_used: u8,
+    response_started: bool,
+    phase: AttemptPhase,
+}
+
+impl Default for AttemptState {
+    fn default() -> Self {
+        Self {
+            posts_started: 0,
+            repairs_used: 0,
+            response_started: false,
+            phase: AttemptPhase::ReadyInitial,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProviderFailure {
-    pub status: u16,
-    pub error_type: &'static str,
-    pub message: &'static str,
-    pub provider: String,
-    pub route: String,
-    pub failure_class: &'static str,
-    pub upstream_status: Option<u16>,
-    pub retryable: bool,
-    pub correlation_id: String,
-    pub recovery: &'static str,
+    status: u16,
+    error_type: &'static str,
+    message: &'static str,
+    provider: ProviderId,
+    route: RouteMode,
+    failure_class: &'static str,
+    upstream_status: Option<u16>,
+    retryable: bool,
+    correlation_id: CorrelationId,
+    recovery: &'static str,
 }
 
 impl ProviderFailure {
@@ -82,11 +175,11 @@ impl ProviderFailure {
         let mut error = json!({
             "type": self.error_type,
             "message": self.message,
-            "provider": self.provider,
-            "route": self.route,
+            "provider": self.provider.safe_label(),
+            "route": self.route.safe_label(),
             "failure_class": self.failure_class,
             "retryable": self.retryable,
-            "correlation_id": self.correlation_id,
+            "correlation_id": self.correlation_id.safe_label(),
             "recovery": self.recovery,
         });
         if let Some(status) = self.upstream_status {
@@ -104,28 +197,55 @@ pub enum AttemptDirective {
     Cancel,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TransitionError {
+    PostNotAuthorized {
+        phase: AttemptPhase,
+    },
+    PostCapacityExhausted {
+        phase: AttemptPhase,
+    },
+    ResponseStartNotAllowed {
+        phase: AttemptPhase,
+    },
+    ObservationNotAllowed {
+        observation: ObservationKind,
+        phase: AttemptPhase,
+    },
+}
+
 #[derive(Clone, Debug)]
 pub struct AttemptController {
     context: RouteContext,
     state: AttemptState,
-    enabled_repairs: Vec<RepairKind>,
+    enabled_repair: Option<RepairKind>,
     last_observation: Option<FailureObservation>,
     last_directive: Option<AttemptDirective>,
+    last_transition_error: Option<TransitionError>,
 }
 
 impl AttemptController {
-    pub fn new(context: RouteContext, enabled_repairs: Vec<RepairKind>) -> Self {
+    pub fn new(context: RouteContext, enabled_repair: Option<RepairKind>) -> Self {
         Self {
             context,
             state: AttemptState::default(),
-            enabled_repairs,
+            enabled_repair,
             last_observation: None,
             last_directive: None,
+            last_transition_error: None,
         }
     }
 
-    pub fn context(&self) -> &RouteContext {
-        &self.context
+    pub fn provider_label(&self) -> &'static str {
+        self.context.provider.safe_label()
+    }
+
+    pub fn route_label(&self) -> &'static str {
+        self.context.route.safe_label()
+    }
+
+    pub fn correlation_id_label(&self) -> &'static str {
+        self.context.correlation_id.safe_label()
     }
 
     pub fn state(&self) -> &AttemptState {
@@ -140,53 +260,90 @@ impl AttemptController {
         self.last_directive.as_ref()
     }
 
-    pub fn begin_post(&mut self) -> bool {
-        if self.state.response_started || self.state.posts_started >= self.context.policy.max_posts
-        {
-            return false;
-        }
-        self.state.posts_started += 1;
-        self.last_observation = None;
-        self.last_directive = None;
-        true
+    pub fn last_transition_error(&self) -> Option<&TransitionError> {
+        self.last_transition_error.as_ref()
     }
 
-    pub fn mark_response_started(&mut self) -> bool {
-        if self.state.posts_started == 0 {
-            return false;
+    pub fn begin_post(&mut self) -> Result<(), TransitionError> {
+        let phase = self.state.phase;
+        if !matches!(
+            phase,
+            AttemptPhase::ReadyInitial
+                | AttemptPhase::RetryAuthorized
+                | AttemptPhase::RepairAuthorized(_)
+        ) {
+            return self.reject(TransitionError::PostNotAuthorized { phase });
         }
+        if self.state.posts_started >= self.context.policy.max_posts {
+            return self.reject(TransitionError::PostCapacityExhausted { phase });
+        }
+
+        self.state.posts_started += 1;
+        self.state.phase = AttemptPhase::InFlight;
+        self.last_observation = None;
+        self.last_directive = None;
+        self.last_transition_error = None;
+        Ok(())
+    }
+
+    pub fn mark_response_started(&mut self) -> Result<(), TransitionError> {
+        let phase = self.state.phase;
+        if phase != AttemptPhase::InFlight {
+            return self.reject(TransitionError::ResponseStartNotAllowed { phase });
+        }
+
         self.state.response_started = true;
-        true
+        self.last_transition_error = None;
+        Ok(())
     }
 
     pub fn reset(&mut self) {
         self.state = AttemptState::default();
         self.last_observation = None;
         self.last_directive = None;
+        self.last_transition_error = None;
     }
 
-    pub fn observe(&mut self, observation: FailureObservation) -> AttemptDirective {
+    pub fn observe(
+        &mut self,
+        observation: FailureObservation,
+    ) -> Result<AttemptDirective, TransitionError> {
+        let phase = self.state.phase;
+        if !self.observation_allowed(&observation) {
+            return self.reject(TransitionError::ObservationNotAllowed {
+                observation: observation.kind(),
+                phase,
+            });
+        }
+
         let directive = self.decide(&observation);
+        self.state.phase = match &directive {
+            AttemptDirective::Fail(_) | AttemptDirective::Cancel => AttemptPhase::Terminal,
+            AttemptDirective::RetryAfter(_) => AttemptPhase::RetryAuthorized,
+            AttemptDirective::RepairOnce(repair) => AttemptPhase::RepairAuthorized(*repair),
+        };
         self.last_observation = Some(observation);
         self.last_directive = Some(directive.clone());
-        directive
+        self.last_transition_error = None;
+        Ok(directive)
+    }
+
+    fn observation_allowed(&self, observation: &FailureObservation) -> bool {
+        match observation {
+            FailureObservation::Capability => self.state.phase == AttemptPhase::ReadyInitial,
+            FailureObservation::Http { .. }
+            | FailureObservation::Network
+            | FailureObservation::Protocol(_) => self.state.phase == AttemptPhase::InFlight,
+            FailureObservation::Cancelled => matches!(
+                self.state.phase,
+                AttemptPhase::ReadyInitial | AttemptPhase::InFlight
+            ),
+        }
     }
 
     fn decide(&mut self, observation: &FailureObservation) -> AttemptDirective {
-        if matches!(observation, FailureObservation::Cancelled) {
-            return AttemptDirective::Cancel;
-        }
-        if let Some(repair) = self.repair_from(observation) {
-            if !self.state.response_started
-                && self.state.repairs_used == 0
-                && self.enabled_repairs.contains(&repair)
-            {
-                self.state.repairs_used = 1;
-                return AttemptDirective::RepairOnce(repair);
-            }
-        }
         match observation {
-            FailureObservation::Capability { .. } => self.fail(
+            FailureObservation::Capability => self.fail(
                 400,
                 "invalid_request_error",
                 "Provider Route capability cannot preserve this request",
@@ -214,7 +371,6 @@ impl AttemptController {
                 status: 429,
                 rate_kind: Some(RateKind::RateLimit),
                 retry_after_ms,
-                ..
             } if self.can_retry() => AttemptDirective::RetryAfter(
                 retry_after_ms
                     .unwrap_or_else(|| self.backoff_ms())
@@ -279,7 +435,13 @@ impl AttemptController {
                 None,
                 "Check the network route before starting a new request",
             ),
-            FailureObservation::Protocol { .. } => self.fail(
+            FailureObservation::Protocol(ProtocolClass::UnsupportedAutomaticToolChoice)
+                if self.can_repair(RepairKind::OmitUnsupportedAutomaticToolChoice) =>
+            {
+                self.state.repairs_used += 1;
+                AttemptDirective::RepairOnce(RepairKind::OmitUnsupportedAutomaticToolChoice)
+            }
+            FailureObservation::Protocol(_) => self.fail(
                 502,
                 "api_error",
                 "Provider response violated the expected protocol",
@@ -292,8 +454,16 @@ impl AttemptController {
     }
 
     fn can_retry(&self) -> bool {
-        !self.state.response_started
-            && self.state.posts_started > 0
+        self.state.phase == AttemptPhase::InFlight
+            && !self.state.response_started
+            && self.state.posts_started < self.context.policy.max_posts
+    }
+
+    fn can_repair(&self, repair: RepairKind) -> bool {
+        self.state.phase == AttemptPhase::InFlight
+            && !self.state.response_started
+            && self.state.repairs_used == 0
+            && self.enabled_repair == Some(repair)
             && self.state.posts_started < self.context.policy.max_posts
     }
 
@@ -303,15 +473,6 @@ impl AttemptController {
             delay = delay.saturating_mul(2);
         }
         delay.min(self.context.policy.max_delay_ms)
-    }
-
-    fn repair_from(&self, observation: &FailureObservation) -> Option<RepairKind> {
-        match observation {
-            FailureObservation::Capability { repair }
-            | FailureObservation::Protocol { repair }
-            | FailureObservation::Http { repair, .. } => *repair,
-            FailureObservation::Network | FailureObservation::Cancelled => None,
-        }
     }
 
     fn fail(
@@ -327,13 +488,18 @@ impl AttemptController {
             status,
             error_type,
             message,
-            provider: self.context.provider.clone(),
-            route: self.context.route.clone(),
+            provider: self.context.provider,
+            route: self.context.route,
             failure_class,
             upstream_status,
             retryable: false,
-            correlation_id: self.context.correlation_id.clone(),
+            correlation_id: self.context.correlation_id,
             recovery,
         })
+    }
+
+    fn reject<T>(&mut self, error: TransitionError) -> Result<T, TransitionError> {
+        self.last_transition_error = Some(error);
+        Err(error)
     }
 }

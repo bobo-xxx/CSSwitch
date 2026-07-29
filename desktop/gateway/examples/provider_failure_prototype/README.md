@@ -12,7 +12,7 @@ Does a pure Attempt Controller provide a sufficiently small interface to central
 cargo run --offline --manifest-path desktop/gateway/Cargo.toml --example provider_failure_prototype
 ```
 
-The prototype is in-memory only. It performs no network, OAuth, proxy, or filesystem-persistence operations.
+The prototype is in-memory only. It performs no network, OAuth, proxy, or filesystem-persistence operations. The shell renders the typed authorization phase, the last accepted observation/directive, and any rejected transition.
 
 ## Actions
 
@@ -25,16 +25,16 @@ The prototype is in-memory only. It performs no network, OAuth, proxy, or filesy
 - `5`: quota HTTP 429
 - `6`: network failure
 - `7`: upstream HTTP 500
-- `8`: allowlisted Safe Repair observation
+- `8`: allowlisted protocol Safe Repair observation
 - `9`: unrepairable protocol failure
+- `408`: upstream HTTP 408 request timeout
+- `409`: upstream HTTP 409 conflict
 - `c`: cancellation
 - `r`: reset in-memory state
 - `q`: quit
 
-## Verdict
+## Validation state
 
-Decision: accepted
+Decision: pending re-validation
 
-The user validated the pure Attempt Controller seam after driving the permanent-failure, retry-exhaustion, one-repair, response-started, rate/quota, authentication/authorization, and cancellation scenarios.
-
-Observation: The controller centralizes policy and state without taking Provider Route I/O away from adapters.
+The previous acceptance predates the typed attempt-authorization and forbidden-data hardening. Final review must re-drive the documented scenarios before deciding whether to accept the seam.
