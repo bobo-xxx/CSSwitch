@@ -8,9 +8,12 @@ use std::time::Duration;
 
 use serde_json::Value;
 
-use super::{handle_codex_messages_with_policy, CodexRequestPolicy};
+use super::{
+    handle_codex_messages_with_policy_and_runtime, CodexAttemptRuntime, CodexRequestPolicy,
+};
 use crate::codex_auth::InferenceSecrets;
 use crate::codex_transport::CodexTransport;
+use crate::provider_failure::AttemptDiagnostic;
 
 const ACCESS_SENTINEL: &str = "ACCEPTANCE_ACCESS_TOKEN_SENTINEL";
 const ACCOUNT_SENTINEL: &str = "ACCEPTANCE_ACCOUNT_SENTINEL";
@@ -21,6 +24,32 @@ const MAX_REQUEST_HEADER_BYTES: usize = 16 * 1024;
 const MAX_REQUEST_BODY_BYTES: usize = 256 * 1024;
 const MAX_REQUEST_TOTAL_BYTES: usize = MAX_REQUEST_HEADER_BYTES + MAX_REQUEST_BODY_BYTES;
 const CAPTURED_REQUEST_HEADERS: [&str; 2] = ["accept", "content-type"];
+
+#[derive(Default)]
+struct RecordingAttemptRuntime {
+    delays_ms: Vec<u64>,
+    diagnostics: Vec<Value>,
+    cancel_on_wait: bool,
+}
+
+impl CodexAttemptRuntime for RecordingAttemptRuntime {
+    fn wait(
+        &mut self,
+        delay_ms: u64,
+        cancellation: &crate::codex_transport::CodexCancellation,
+    ) -> bool {
+        self.delays_ms.push(delay_ms);
+        if self.cancel_on_wait {
+            cancellation.cancel();
+        }
+        !cancellation.is_cancelled()
+    }
+
+    fn emit(&mut self, diagnostic: AttemptDiagnostic) {
+        self.diagnostics
+            .push(serde_json::to_value(diagnostic).expect("serialize attempt diagnostic"));
+    }
+}
 
 struct AcceptanceCase {
     request: Value,
@@ -34,6 +63,8 @@ struct AcceptanceResult {
     downstream: Vec<u8>,
     script: ScriptResult,
     auth_rejections: Vec<u16>,
+    delays_ms: Vec<u64>,
+    diagnostics: Vec<Value>,
 }
 
 impl AcceptanceResult {
@@ -627,6 +658,13 @@ fn manual_request(address: SocketAddr, method: &str, path: &str, body: &[u8]) ->
 }
 
 fn run_case(case: AcceptanceCase) -> AcceptanceResult {
+    run_case_with_runtime(case, RecordingAttemptRuntime::default())
+}
+
+fn run_case_with_runtime(
+    case: AcceptanceCase,
+    mut runtime: RecordingAttemptRuntime,
+) -> AcceptanceResult {
     let expected_path = case.endpoint_path;
     let upstream = ScriptedCodexUpstream::start(case.steps);
     let transport = CodexTransport::for_test(upstream.endpoint(case.endpoint_path))
@@ -634,7 +672,7 @@ fn run_case(case: AcceptanceCase) -> AcceptanceResult {
     let auth_rejections = Arc::new(Mutex::new(Vec::new()));
     let auth_rejections_for_handler = Arc::clone(&auth_rejections);
     let downstream = capture_downstream(|stream| {
-        handle_codex_messages_with_policy(
+        handle_codex_messages_with_policy_and_runtime(
             stream,
             &case.request,
             case.is_stream,
@@ -650,6 +688,7 @@ fn run_case(case: AcceptanceCase) -> AcceptanceResult {
                     .expect("lock auth rejections")
                     .push(status);
             },
+            &mut runtime,
         );
     });
     let script = upstream.finish();
@@ -662,6 +701,8 @@ fn run_case(case: AcceptanceCase) -> AcceptanceResult {
         downstream,
         script,
         auth_rejections,
+        delays_ms: runtime.delays_ms,
+        diagnostics: runtime.diagnostics,
     }
 }
 
@@ -680,6 +721,21 @@ fn assert_script_transport_integrity(script: &ScriptResult, expected_path: &str)
         assert_eq!(
             request.path, expected_path,
             "captured attempt must use the configured endpoint path"
+        );
+    }
+}
+
+fn assert_retry_bodies_identical(result: &AcceptanceResult) {
+    let (first, retries) = result
+        .script
+        .requests
+        .split_first()
+        .expect("retry case captured at least one POST");
+    assert!(!retries.is_empty(), "retry case captured a retry POST");
+    for retry in retries {
+        assert_eq!(
+            retry.body, first.body,
+            "retry-only case must reuse the translated body"
         );
     }
 }
@@ -832,6 +888,8 @@ fn contract_failure_schema_and_caller_redaction() {
         steps: vec![redaction_step(), redaction_step(), redaction_step()],
     });
     assert_eq!(result.script.requests.len(), 3);
+    assert_retry_bodies_identical(&result);
+    assert_eq!(result.delays_ms, vec![500, 1_000]);
     assert_eq!(result.script.remaining_steps, 0);
     assert_eq!(result.script.unexpected_posts, 0);
     let raw = result.text();
@@ -899,6 +957,8 @@ fn contract_rate_limit_retries_twice_then_succeeds() {
     });
     assert_eq!(result.status(), 200);
     assert_eq!(result.script.requests.len(), 3);
+    assert_retry_bodies_identical(&result);
+    assert_eq!(result.delays_ms, vec![0, 0]);
     assert_eq!(result.script.remaining_steps, 0);
     assert_eq!(result.script.unexpected_posts, 0);
 }
@@ -917,6 +977,8 @@ fn contract_rate_limit_exhaustion_caps_retry_after() {
         ],
     });
     assert_eq!(result.script.requests.len(), 3);
+    assert_retry_bodies_identical(&result);
+    assert_eq!(result.delays_ms, vec![0, 0]);
     assert_failure_envelope(
         &result,
         429,
@@ -984,6 +1046,8 @@ fn contract_network_and_5xx_retry_within_three_posts() {
     });
     assert_eq!(result.status(), 200);
     assert_eq!(result.script.requests.len(), 3);
+    assert_retry_bodies_identical(&result);
+    assert_eq!(result.delays_ms, vec![500, 0]);
     assert_eq!(result.script.remaining_steps, 0);
 }
 
@@ -1001,6 +1065,8 @@ fn contract_network_only_exhaustion_omits_unknown_upstream_metadata() {
         ],
     });
     assert_eq!(result.script.requests.len(), 3);
+    assert_retry_bodies_identical(&result);
+    assert_eq!(result.delays_ms, vec![500, 1_000]);
     assert_optional_metadata_absent(
         &result,
         &["upstream_status", "request_id", "retry_after_seconds"],
@@ -1014,6 +1080,41 @@ fn contract_network_only_exhaustion_omits_unknown_upstream_metadata() {
         None,
         true,
     );
+    assert_eq!(result.diagnostics.len(), 1);
+    let diagnostic = &result.diagnostics[0];
+    assert_eq!(diagnostic["outcome"], "failed");
+    assert_eq!(diagnostic["provider"], "codex");
+    assert_eq!(diagnostic["route"], "responses");
+    assert_eq!(diagnostic["posts"], 3);
+    assert_eq!(diagnostic["repairs"], 0);
+    assert_eq!(diagnostic["delays_ms"], serde_json::json!([500, 1_000]));
+    assert_eq!(diagnostic["mapped_status"], 502);
+    assert!(diagnostic.get("upstream_status").is_none());
+    assert_eq!(diagnostic["failure_class"], "network");
+    assert_eq!(diagnostic["retryable"], true);
+}
+
+#[test]
+fn contract_cancellation_during_retry_wait_stops_without_failure_output() {
+    let result = run_case_with_runtime(
+        AcceptanceCase {
+            request: anthropic_request(false),
+            is_stream: false,
+            use_responses_lite: false,
+            endpoint_path: "/responses",
+            steps: vec![UpstreamStep::Disconnect, UpstreamStep::Sse(complete_sse())],
+        },
+        RecordingAttemptRuntime {
+            cancel_on_wait: true,
+            ..RecordingAttemptRuntime::default()
+        },
+    );
+    assert_eq!(result.script.requests.len(), 1);
+    assert_eq!(result.script.remaining_steps, 1);
+    assert_eq!(result.script.unexpected_posts, 0);
+    assert_eq!(result.delays_ms, vec![500]);
+    assert!(result.downstream.is_empty());
+    assert!(result.diagnostics.is_empty());
 }
 
 fn assert_transient_exhaustion(status: u16, reason: &'static str, downstream_status: u16) {
@@ -1029,6 +1130,7 @@ fn assert_transient_exhaustion(status: u16, reason: &'static str, downstream_sta
         ],
     });
     assert_eq!(result.script.requests.len(), 3);
+    assert_retry_bodies_identical(&result);
     assert_failure_envelope(
         &result,
         downstream_status,
@@ -1271,6 +1373,8 @@ fn assert_invalid_request_id_is_omitted(request_id: &str) {
         ],
     });
     assert_eq!(result.script.requests.len(), 3);
+    assert_retry_bodies_identical(&result);
+    assert_eq!(result.delays_ms, vec![500, 1_000]);
     assert_eq!(result.script.remaining_steps, 0);
     assert_eq!(result.script.unexpected_posts, 0);
     assert_optional_metadata_absent(&result, &["request_id", "retry_after_seconds"]);

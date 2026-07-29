@@ -1095,6 +1095,33 @@ fn write_provider_failure(
     );
 }
 
+trait CodexAttemptRuntime {
+    fn wait(&mut self, delay_ms: u64, cancellation: &codex_transport::CodexCancellation) -> bool;
+    fn emit(&mut self, diagnostic: crate::provider_failure::AttemptDiagnostic);
+}
+
+struct ProductionCodexAttemptRuntime;
+
+impl CodexAttemptRuntime for ProductionCodexAttemptRuntime {
+    fn wait(&mut self, delay_ms: u64, cancellation: &codex_transport::CodexCancellation) -> bool {
+        let deadline = std::time::Instant::now() + Duration::from_millis(delay_ms);
+        while std::time::Instant::now() < deadline {
+            if cancellation.is_cancelled() {
+                return false;
+            }
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            thread::sleep(remaining.min(Duration::from_millis(25)));
+        }
+        !cancellation.is_cancelled()
+    }
+
+    fn emit(&mut self, diagnostic: crate::provider_failure::AttemptDiagnostic) {
+        if let Ok(value) = serde_json::to_string(&diagnostic) {
+            eprintln!("provider_attempt {value}");
+        }
+    }
+}
+
 fn handle_codex_messages_with_policy(
     stream: &mut TcpStream,
     raw: &Value,
@@ -1103,6 +1130,29 @@ fn handle_codex_messages_with_policy(
     transport: &codex_transport::CodexTransport,
     policy: CodexRequestPolicy<'_>,
     mut auth_rejected: impl FnMut(u16, u64),
+) {
+    let mut runtime = ProductionCodexAttemptRuntime;
+    handle_codex_messages_with_policy_and_runtime(
+        stream,
+        raw,
+        is_stream,
+        secrets,
+        transport,
+        policy,
+        &mut auth_rejected,
+        &mut runtime,
+    );
+}
+
+fn handle_codex_messages_with_policy_and_runtime(
+    stream: &mut TcpStream,
+    raw: &Value,
+    is_stream: bool,
+    secrets: codex_auth::InferenceSecrets,
+    transport: &codex_transport::CodexTransport,
+    policy: CodexRequestPolicy<'_>,
+    mut auth_rejected: impl FnMut(u16, u64),
+    runtime: &mut dyn CodexAttemptRuntime,
 ) {
     let target_model = match raw.get("model").and_then(Value::as_str) {
         Some(model) if !model.trim().is_empty() => model,
@@ -1146,13 +1196,6 @@ fn handle_codex_messages_with_policy(
     let route_context =
         crate::provider_failure::RouteContext::codex(route, next_codex_correlation_id());
     let mut controller = crate::provider_failure::AttemptController::new(route_context, false);
-    let body = match serde_json::to_vec(&translated) {
-        Ok(body) => body,
-        Err(_) => {
-            invalid_request_json(stream, "Codex request encoding failed");
-            return;
-        }
-    };
     let generation = secrets.auth_generation();
     let cancellation = codex_transport::CodexCancellation::default();
     let _cancellation_watch = match DownstreamCancellationWatch::start(stream, cancellation.clone())
@@ -1163,37 +1206,59 @@ fn handle_codex_messages_with_policy(
             return;
         }
     };
-    controller
-        .begin_post()
-        .expect("initial Codex POST is authorized");
-    let upstream =
-        match transport.open_responses(&secrets, body, policy.use_responses_lite, cancellation) {
-            Ok(upstream) => upstream,
+    let upstream = loop {
+        controller
+            .begin_post()
+            .expect("controller authorized Codex POST");
+        let body = match serde_json::to_vec(&translated) {
+            Ok(body) => body,
+            Err(_) => {
+                invalid_request_json(stream, "Codex request encoding failed");
+                return;
+            }
+        };
+        match transport.open_responses(
+            &secrets,
+            body,
+            policy.use_responses_lite,
+            cancellation.clone(),
+        ) {
+            Ok(upstream) => {
+                controller
+                    .mark_response_started()
+                    .expect("opened Codex response follows in-flight POST");
+                break upstream;
+            }
             Err(error) => {
-                let observation = error.observation();
                 if let Some(status @ (401 | 403)) = error.upstream_status {
                     auth_rejected(status, generation);
                 }
                 match controller
-                    .observe(observation)
+                    .observe(error.observation())
                     .expect("in-flight Codex observation is authorized")
                 {
+                    crate::provider_failure::AttemptDirective::RetryAfter(delay_ms) => {
+                        if !runtime.wait(delay_ms, &cancellation) {
+                            controller
+                                .observe(crate::provider_failure::FailureObservation::Cancelled)
+                                .expect("cancellation is terminal");
+                            return;
+                        }
+                    }
                     crate::provider_failure::AttemptDirective::Fail(failure) => {
+                        runtime.emit(controller.failed_diagnostic(&failure));
                         write_provider_failure(stream, &failure);
                         return;
                     }
                     crate::provider_failure::AttemptDirective::Cancel => return,
-                    crate::provider_failure::AttemptDirective::RetryAfter(_) => {
-                        api_error_json(stream, 500, "Codex retry runtime is not installed");
-                        return;
-                    }
                     crate::provider_failure::AttemptDirective::RepairOnce(_) => {
                         api_error_json(stream, 500, "Codex repair runtime is not installed");
                         return;
                     }
                 }
             }
-        };
+        }
+    };
     let mut reducer = codex_protocol::ResponsesReducer::new(
         target_model,
         secrets.auth_epoch(),
@@ -2268,7 +2333,8 @@ mod tests {
         handle_codex_messages_with_catalog, handle_codex_messages_with_secrets, handle_post,
         map_codex_auth_error, openai_chat_reasoning_signer, pump_codex_stream, stream_error_event,
         write_codex_models_response, CodexComponents, CodexNonstreamError, CodexPumpError,
-        KimiServerToolFilter, RequestHead, RequestNonceGenerator, StreamFilter, StreamTermination,
+        KimiServerToolFilter, ProductionCodexAttemptRuntime, RequestHead, RequestNonceGenerator,
+        StreamFilter, StreamTermination,
     };
     use crate::codex_auth::{InferenceSecrets, OAuthErrorCode, OAuthFlowError};
     use crate::codex_models::CodexModelCatalog;
@@ -2279,6 +2345,44 @@ mod tests {
     use crate::models::RelayModelCache;
 
     struct FailingReader;
+
+    #[test]
+    fn production_codex_retry_wait_observes_existing_cancellation() {
+        use super::CodexAttemptRuntime;
+
+        let cancellation = crate::codex_transport::CodexCancellation::default();
+        cancellation.cancel();
+        let mut runtime = ProductionCodexAttemptRuntime;
+        let started = std::time::Instant::now();
+        assert!(!runtime.wait(60_000, &cancellation));
+        assert!(started.elapsed() < Duration::from_millis(100));
+    }
+
+    #[test]
+    fn production_codex_retry_wait_observes_cancellation_after_wait_begins() {
+        use super::CodexAttemptRuntime;
+
+        let cancellation = crate::codex_transport::CodexCancellation::default();
+        let wait_cancellation = cancellation.clone();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let waiter = thread::spawn(move || {
+            let mut runtime = ProductionCodexAttemptRuntime;
+            let started = Instant::now();
+            entered_tx.send(()).expect("signal production wait entry");
+            let continued = runtime.wait(60_000, &wait_cancellation);
+            (continued, started.elapsed())
+        });
+        entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("production wait entered");
+        thread::sleep(Duration::from_millis(10));
+        let cancelled_at = Instant::now();
+        cancellation.cancel();
+        let (continued, total_wait) = waiter.join().expect("join production wait");
+        assert!(!continued);
+        assert!(total_wait >= Duration::from_millis(10));
+        assert!(cancelled_at.elapsed() < Duration::from_millis(100));
+    }
 
     impl Read for FailingReader {
         fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {

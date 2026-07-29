@@ -486,6 +486,17 @@ impl AttemptController {
         }
     }
 
+    pub(crate) fn failed_diagnostic(&self, failure: &ProviderFailure) -> AttemptDiagnostic {
+        let snapshot = self.snapshot();
+        AttemptDiagnostic::failed(
+            &self.context,
+            snapshot.posts,
+            snapshot.repairs,
+            snapshot.delays_ms,
+            failure,
+        )
+    }
+
     pub(crate) fn begin_post(&mut self) -> Result<(), TransitionError> {
         let authorized = matches!(
             self.phase,
