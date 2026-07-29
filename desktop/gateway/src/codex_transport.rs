@@ -6,8 +6,6 @@ use std::time::Duration;
 
 use reqwest::header::{HeaderValue, ACCEPT, AUTHORIZATION, CONTENT_TYPE, USER_AGENT};
 use reqwest::{Client, Response};
-use serde::de::{self, Visitor};
-use serde::{Deserialize, Deserializer};
 use zeroize::Zeroizing;
 
 use crate::codex_auth::InferenceSecrets;
@@ -164,77 +162,25 @@ enum FailureBodyToken {
 }
 
 impl FailureBodyToken {
-    fn from_str(value: &str) -> Self {
-        match value {
-            "insufficient_quota" => Self::InsufficientQuota,
-            "rate_limit_error" => Self::RateLimitError,
-            "rate_limit_exceeded" => Self::RateLimitExceeded,
-            "unsupported_value" => Self::UnsupportedValue,
-            "tool_choice" => Self::ToolChoice,
-            _ => Self::Other,
+    fn from_json_string(value: JsonString<'_>) -> Self {
+        if value.equals_ascii(b"insufficient_quota") {
+            Self::InsufficientQuota
+        } else if value.equals_ascii(b"rate_limit_error") {
+            Self::RateLimitError
+        } else if value.equals_ascii(b"rate_limit_exceeded") {
+            Self::RateLimitExceeded
+        } else if value.equals_ascii(b"unsupported_value") {
+            Self::UnsupportedValue
+        } else if value.equals_ascii(b"tool_choice") {
+            Self::ToolChoice
+        } else {
+            Self::Other
         }
     }
 }
 
-struct FailureBodyTokenVisitor;
-
-impl Visitor<'_> for FailureBodyTokenVisitor {
-    type Value = FailureBodyToken;
-
-    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("a provider failure token")
-    }
-
-    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
-    where
-        E: de::Error,
-    {
-        Ok(FailureBodyToken::from_str(value))
-    }
-
-    fn visit_borrowed_str<E>(self, value: &'_ str) -> Result<Self::Value, E>
-    where
-        E: de::Error,
-    {
-        self.visit_str(value)
-    }
-}
-
-impl<'de> Deserialize<'de> for FailureBodyToken {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        deserializer.deserialize_str(FailureBodyTokenVisitor)
-    }
-}
-
-#[derive(Deserialize)]
-struct FailureBodyDocument {
-    #[serde(default)]
-    error: Option<FailureBodyError>,
-}
-
-#[derive(Deserialize)]
-struct FailureBodyError {
-    #[serde(rename = "type", default)]
-    kind: Option<FailureBodyToken>,
-    #[serde(default)]
-    code: Option<FailureBodyToken>,
-    #[serde(default)]
-    param: Option<FailureBodyToken>,
-}
-
-const FAILURE_PARSED_STORAGE: usize =
-    std::mem::size_of::<FailureBodyDocument>() + std::mem::size_of::<FailureBodyFacts>();
-// One region retains the admitted input. Two more input-sized regions cover
-// serde_json's transient escaped-string scratch and conservative amortized
-// capacity slack. Projection visits strings directly into closed enums, so no
-// decoded string survives the visitor. The parser is never invoked when this
-// caller-controlled capacity calculation would exceed FAILURE_BODY_LIMIT.
-const FAILURE_BODY_VARIABLE_REGIONS: usize = 3;
-const FAILURE_BODY_INPUT_LIMIT: usize =
-    (FAILURE_BODY_LIMIT - FAILURE_PARSED_STORAGE) / FAILURE_BODY_VARIABLE_REGIONS;
+const FAILURE_JSON_MAX_DEPTH: usize = 16;
+const FAILURE_JSON_MAX_FIELDS: usize = 128;
 
 const EMPTY_FAILURE_BODY_FACTS: FailureBodyFacts = FailureBodyFacts {
     rate_kind: None,
@@ -242,87 +188,470 @@ const EMPTY_FAILURE_BODY_FACTS: FailureBodyFacts = FailureBodyFacts {
     error_param: ErrorParam::Absent,
 };
 
-fn failure_body_memory_budget(input_capacity: usize) -> Option<usize> {
-    input_capacity
-        .checked_mul(FAILURE_BODY_VARIABLE_REGIONS)?
-        .checked_add(FAILURE_PARSED_STORAGE)
+#[derive(Clone, Copy)]
+struct JsonString<'a> {
+    raw: &'a [u8],
+}
+
+impl JsonString<'_> {
+    fn equals_ascii(self, expected: &[u8]) -> bool {
+        let mut raw_offset = 0;
+        let mut expected_offset = 0;
+        while raw_offset < self.raw.len() {
+            let (decoded, consumed) = if self.raw[raw_offset] == b'\\' {
+                let Some(escaped) = self.raw.get(raw_offset + 1).copied() else {
+                    return false;
+                };
+                match escaped {
+                    b'"' | b'\\' | b'/' => (u32::from(escaped), 2),
+                    b'b' => (u32::from(b'\x08'), 2),
+                    b'f' => (u32::from(b'\x0c'), 2),
+                    b'n' => (u32::from(b'\n'), 2),
+                    b'r' => (u32::from(b'\r'), 2),
+                    b't' => (u32::from(b'\t'), 2),
+                    b'u' => {
+                        let Some(high) = parse_hex_quad(self.raw, raw_offset + 2) else {
+                            return false;
+                        };
+                        if (0xd800..=0xdbff).contains(&high) {
+                            if self.raw.get(raw_offset + 6..raw_offset + 8) != Some(b"\\u") {
+                                return false;
+                            }
+                            let Some(low) = parse_hex_quad(self.raw, raw_offset + 8) else {
+                                return false;
+                            };
+                            if !(0xdc00..=0xdfff).contains(&low) {
+                                return false;
+                            }
+                            let scalar = 0x1_0000
+                                + ((u32::from(high) - 0xd800) << 10)
+                                + (u32::from(low) - 0xdc00);
+                            (scalar, 12)
+                        } else {
+                            (u32::from(high), 6)
+                        }
+                    }
+                    _ => return false,
+                }
+            } else if self.raw[raw_offset].is_ascii() {
+                (u32::from(self.raw[raw_offset]), 1)
+            } else {
+                let Ok(suffix) = std::str::from_utf8(&self.raw[raw_offset..]) else {
+                    return false;
+                };
+                let Some(character) = suffix.chars().next() else {
+                    return false;
+                };
+                (character as u32, character.len_utf8())
+            };
+            if expected.get(expected_offset).copied().map(u32::from) != Some(decoded) {
+                return false;
+            }
+            raw_offset += consumed;
+            expected_offset += 1;
+        }
+        expected_offset == expected.len()
+    }
+}
+
+fn parse_hex_quad(input: &[u8], start: usize) -> Option<u16> {
+    let digits = input.get(start..start + 4)?;
+    digits.iter().try_fold(0_u16, |value, digit| {
+        let digit = match digit {
+            b'0'..=b'9' => u16::from(*digit - b'0'),
+            b'a'..=b'f' => u16::from(*digit - b'a' + 10),
+            b'A'..=b'F' => u16::from(*digit - b'A' + 10),
+            _ => return None,
+        };
+        value.checked_mul(16)?.checked_add(digit)
+    })
+}
+
+struct FailureJsonScanner<'a> {
+    input: &'a [u8],
+    cursor: usize,
+    fields: usize,
+}
+
+impl<'a> FailureJsonScanner<'a> {
+    fn new(input: &'a [u8]) -> Self {
+        Self {
+            input,
+            cursor: 0,
+            fields: 0,
+        }
+    }
+
+    fn project(mut self) -> Option<FailureBodyFacts> {
+        self.skip_whitespace();
+        let facts = self.parse_root_object(1)?;
+        self.skip_whitespace();
+        (self.cursor == self.input.len()).then_some(facts)
+    }
+
+    fn parse_root_object(&mut self, depth: usize) -> Option<FailureBodyFacts> {
+        self.require_depth(depth)?;
+        self.expect(b'{')?;
+        self.skip_whitespace();
+        if self.consume(b'}') {
+            return Some(EMPTY_FAILURE_BODY_FACTS);
+        }
+        let mut facts = EMPTY_FAILURE_BODY_FACTS;
+        let mut saw_error = false;
+        loop {
+            self.record_field()?;
+            let key = self.parse_string()?;
+            self.skip_whitespace();
+            self.expect(b':')?;
+            self.skip_whitespace();
+            if key.equals_ascii(b"error") {
+                if saw_error {
+                    return None;
+                }
+                saw_error = true;
+                facts = self.parse_error_value(depth + 1)?;
+            } else {
+                self.skip_value(depth + 1)?;
+            }
+            self.skip_whitespace();
+            if self.consume(b'}') {
+                return Some(facts);
+            }
+            self.expect(b',')?;
+            self.skip_whitespace();
+        }
+    }
+
+    fn parse_error_value(&mut self, depth: usize) -> Option<FailureBodyFacts> {
+        if self.peek() != Some(b'{') {
+            self.skip_value(depth)?;
+            return Some(EMPTY_FAILURE_BODY_FACTS);
+        }
+        self.require_depth(depth)?;
+        self.expect(b'{')?;
+        self.skip_whitespace();
+        if self.consume(b'}') {
+            return Some(EMPTY_FAILURE_BODY_FACTS);
+        }
+        let mut kind = None;
+        let mut code = None;
+        let mut param = None;
+        let mut saw_kind = false;
+        let mut saw_code = false;
+        let mut saw_param = false;
+        loop {
+            self.record_field()?;
+            let key = self.parse_string()?;
+            self.skip_whitespace();
+            self.expect(b':')?;
+            self.skip_whitespace();
+            if key.equals_ascii(b"type") {
+                if saw_kind {
+                    return None;
+                }
+                saw_kind = true;
+                kind = self.parse_optional_token()?;
+            } else if key.equals_ascii(b"code") {
+                if saw_code {
+                    return None;
+                }
+                saw_code = true;
+                code = self.parse_optional_token()?;
+            } else if key.equals_ascii(b"param") {
+                if saw_param {
+                    return None;
+                }
+                saw_param = true;
+                param = self.parse_optional_token()?;
+            } else {
+                self.skip_value(depth + 1)?;
+            }
+            self.skip_whitespace();
+            if self.consume(b'}') {
+                break;
+            }
+            self.expect(b',')?;
+            self.skip_whitespace();
+        }
+        let quota = kind == Some(FailureBodyToken::InsufficientQuota)
+            || code == Some(FailureBodyToken::InsufficientQuota);
+        let rate = kind == Some(FailureBodyToken::RateLimitError)
+            || code == Some(FailureBodyToken::RateLimitExceeded);
+        Some(FailureBodyFacts {
+            rate_kind: if quota {
+                Some(RateKind::Quota)
+            } else if rate {
+                Some(RateKind::RateLimit)
+            } else {
+                None
+            },
+            error_code: match code {
+                Some(FailureBodyToken::UnsupportedValue) => ErrorCode::UnsupportedValue,
+                Some(FailureBodyToken::InsufficientQuota) => ErrorCode::InsufficientQuota,
+                Some(FailureBodyToken::RateLimitExceeded) => ErrorCode::RateLimitExceeded,
+                _ if kind == Some(FailureBodyToken::InsufficientQuota) => {
+                    ErrorCode::InsufficientQuota
+                }
+                Some(_) => ErrorCode::Other,
+                None => ErrorCode::Absent,
+            },
+            error_param: match param {
+                Some(FailureBodyToken::ToolChoice) => ErrorParam::ToolChoice,
+                Some(_) => ErrorParam::Other,
+                None => ErrorParam::Absent,
+            },
+        })
+    }
+
+    fn parse_optional_token(&mut self) -> Option<Option<FailureBodyToken>> {
+        if self.peek() == Some(b'"') {
+            return Some(Some(FailureBodyToken::from_json_string(
+                self.parse_string()?,
+            )));
+        }
+        self.consume_literal(b"null").then_some(None)
+    }
+
+    fn skip_value(&mut self, depth: usize) -> Option<()> {
+        self.skip_whitespace();
+        match self.peek()? {
+            b'{' => self.skip_object(depth),
+            b'[' => self.skip_array(depth),
+            b'"' => self.parse_string().map(|_| ()),
+            b't' => self.consume_literal(b"true").then_some(()),
+            b'f' => self.consume_literal(b"false").then_some(()),
+            b'n' => self.consume_literal(b"null").then_some(()),
+            b'-' | b'0'..=b'9' => self.skip_number(),
+            _ => None,
+        }
+    }
+
+    fn skip_object(&mut self, depth: usize) -> Option<()> {
+        self.require_depth(depth)?;
+        self.expect(b'{')?;
+        self.skip_whitespace();
+        if self.consume(b'}') {
+            return Some(());
+        }
+        loop {
+            self.record_field()?;
+            self.parse_string()?;
+            self.skip_whitespace();
+            self.expect(b':')?;
+            self.skip_whitespace();
+            self.skip_value(depth + 1)?;
+            self.skip_whitespace();
+            if self.consume(b'}') {
+                return Some(());
+            }
+            self.expect(b',')?;
+            self.skip_whitespace();
+        }
+    }
+
+    fn skip_array(&mut self, depth: usize) -> Option<()> {
+        self.require_depth(depth)?;
+        self.expect(b'[')?;
+        self.skip_whitespace();
+        if self.consume(b']') {
+            return Some(());
+        }
+        loop {
+            self.skip_value(depth + 1)?;
+            self.skip_whitespace();
+            if self.consume(b']') {
+                return Some(());
+            }
+            self.expect(b',')?;
+            self.skip_whitespace();
+        }
+    }
+
+    fn parse_string(&mut self) -> Option<JsonString<'a>> {
+        self.expect(b'"')?;
+        let start = self.cursor;
+        while let Some(byte) = self.peek() {
+            match byte {
+                b'"' => {
+                    let raw = self.input.get(start..self.cursor)?;
+                    std::str::from_utf8(raw).ok()?;
+                    self.cursor += 1;
+                    return Some(JsonString { raw });
+                }
+                0x00..=0x1f => return None,
+                b'\\' => {
+                    self.cursor += 1;
+                    match self.peek()? {
+                        b'"' | b'\\' | b'/' | b'b' | b'f' | b'n' | b'r' | b't' => {
+                            self.cursor += 1;
+                        }
+                        b'u' => {
+                            self.cursor += 1;
+                            let high = parse_hex_quad(self.input, self.cursor)?;
+                            self.cursor += 4;
+                            if (0xd800..=0xdbff).contains(&high) {
+                                if self.input.get(self.cursor..self.cursor + 2) != Some(b"\\u") {
+                                    return None;
+                                }
+                                self.cursor += 2;
+                                let low = parse_hex_quad(self.input, self.cursor)?;
+                                if !(0xdc00..=0xdfff).contains(&low) {
+                                    return None;
+                                }
+                                self.cursor += 4;
+                            } else if (0xdc00..=0xdfff).contains(&high) {
+                                return None;
+                            }
+                        }
+                        _ => return None,
+                    }
+                }
+                _ => self.cursor += 1,
+            }
+        }
+        None
+    }
+
+    fn skip_number(&mut self) -> Option<()> {
+        self.consume(b'-');
+        match self.peek()? {
+            b'0' => {
+                self.cursor += 1;
+                if self.peek().is_some_and(|byte| byte.is_ascii_digit()) {
+                    return None;
+                }
+            }
+            b'1'..=b'9' => {
+                self.cursor += 1;
+                while self.peek().is_some_and(|byte| byte.is_ascii_digit()) {
+                    self.cursor += 1;
+                }
+            }
+            _ => return None,
+        }
+        if self.consume(b'.') {
+            let start = self.cursor;
+            while self.peek().is_some_and(|byte| byte.is_ascii_digit()) {
+                self.cursor += 1;
+            }
+            if self.cursor == start {
+                return None;
+            }
+        }
+        if self.peek().is_some_and(|byte| matches!(byte, b'e' | b'E')) {
+            self.cursor += 1;
+            if self.peek().is_some_and(|byte| matches!(byte, b'+' | b'-')) {
+                self.cursor += 1;
+            }
+            let start = self.cursor;
+            while self.peek().is_some_and(|byte| byte.is_ascii_digit()) {
+                self.cursor += 1;
+            }
+            if self.cursor == start {
+                return None;
+            }
+        }
+        Some(())
+    }
+
+    fn record_field(&mut self) -> Option<()> {
+        self.fields = self.fields.checked_add(1)?;
+        (self.fields <= FAILURE_JSON_MAX_FIELDS).then_some(())
+    }
+
+    fn require_depth(&self, depth: usize) -> Option<()> {
+        (depth <= FAILURE_JSON_MAX_DEPTH).then_some(())
+    }
+
+    fn skip_whitespace(&mut self) {
+        while self
+            .peek()
+            .is_some_and(|byte| matches!(byte, b' ' | b'\n' | b'\r' | b'\t'))
+        {
+            self.cursor += 1;
+        }
+    }
+
+    fn consume_literal(&mut self, literal: &[u8]) -> bool {
+        if self.input.get(self.cursor..self.cursor + literal.len()) == Some(literal) {
+            self.cursor += literal.len();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn expect(&mut self, expected: u8) -> Option<()> {
+        self.consume(expected).then_some(())
+    }
+
+    fn consume(&mut self, expected: u8) -> bool {
+        if self.peek() == Some(expected) {
+            self.cursor += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn peek(&self) -> Option<u8> {
+        self.input.get(self.cursor).copied()
+    }
 }
 
 struct FailureBodyCollector {
-    body: Vec<u8>,
+    body: [u8; FAILURE_BODY_LIMIT],
+    retained: usize,
     declared_length: usize,
 }
 
 impl FailureBodyCollector {
     fn new(declared_length: Option<u64>) -> Option<Self> {
         let declared_length = usize::try_from(declared_length?).ok()?;
-        if declared_length > FAILURE_BODY_INPUT_LIMIT {
+        if declared_length > FAILURE_BODY_LIMIT {
             return None;
         }
-        let body = Vec::with_capacity(declared_length);
-        (failure_body_memory_budget(body.capacity())? <= FAILURE_BODY_LIMIT).then_some(Self {
-            body,
+        Some(Self {
+            body: [0; FAILURE_BODY_LIMIT],
+            retained: 0,
             declared_length,
         })
     }
 
     fn remaining(&self) -> usize {
-        self.declared_length.saturating_sub(self.body.len())
+        self.declared_length.saturating_sub(self.retained)
     }
 
     fn retain(&mut self, chunk: &[u8]) -> bool {
         if chunk.len() > self.remaining() {
             return false;
         }
-        self.body.extend_from_slice(chunk);
+        let end = self.retained + chunk.len();
+        self.body[self.retained..end].copy_from_slice(chunk);
+        self.retained = end;
         true
     }
 
+    #[cfg(test)]
+    fn retained_len(&self) -> usize {
+        self.retained
+    }
+
     fn facts(self) -> FailureBodyFacts {
-        reduce_failure_body(&self.body)
+        if self.retained != self.declared_length {
+            return EMPTY_FAILURE_BODY_FACTS;
+        }
+        reduce_failure_body(&self.body[..self.retained])
     }
 }
 
 fn reduce_failure_body(body: &[u8]) -> FailureBodyFacts {
-    if body.len() > FAILURE_BODY_INPUT_LIMIT {
+    if body.len() > FAILURE_BODY_LIMIT {
         return EMPTY_FAILURE_BODY_FACTS;
     }
-    let parsed: FailureBodyDocument = match serde_json::from_slice(body) {
-        Ok(value) => value,
-        Err(_) => return EMPTY_FAILURE_BODY_FACTS,
-    };
-    let error = parsed.error;
-    let error_type = error.as_ref().and_then(|value| value.kind);
-    let code = error.as_ref().and_then(|value| value.code);
-    let param = error.as_ref().and_then(|value| value.param);
-    let quota = error_type == Some(FailureBodyToken::InsufficientQuota)
-        || code == Some(FailureBodyToken::InsufficientQuota);
-    let rate = error_type == Some(FailureBodyToken::RateLimitError)
-        || code == Some(FailureBodyToken::RateLimitExceeded);
-    FailureBodyFacts {
-        rate_kind: if quota {
-            Some(RateKind::Quota)
-        } else if rate {
-            Some(RateKind::RateLimit)
-        } else {
-            None
-        },
-        error_code: match code {
-            Some(FailureBodyToken::UnsupportedValue) => ErrorCode::UnsupportedValue,
-            Some(FailureBodyToken::InsufficientQuota) => ErrorCode::InsufficientQuota,
-            Some(FailureBodyToken::RateLimitExceeded) => ErrorCode::RateLimitExceeded,
-            _ if error_type == Some(FailureBodyToken::InsufficientQuota) => {
-                ErrorCode::InsufficientQuota
-            }
-            Some(_) => ErrorCode::Other,
-            None => ErrorCode::Absent,
-        },
-        error_param: match param {
-            Some(FailureBodyToken::ToolChoice) => ErrorParam::ToolChoice,
-            Some(_) => ErrorParam::Other,
-            None => ErrorParam::Absent,
-        },
-    }
+    FailureJsonScanner::new(body)
+        .project()
+        .unwrap_or(EMPTY_FAILURE_BODY_FACTS)
 }
 
 fn parse_retry_after(value: Option<&str>) -> Option<u64> {
@@ -819,9 +1148,9 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{
-        failure_body_memory_budget, parse_request_id, parse_retry_after, reduce_failure_body,
-        CodexCancellation, CodexTransport, FailureBodyCollector, FAILURE_BODY_INPUT_LIMIT,
-        FAILURE_BODY_LIMIT, FAILURE_BODY_VARIABLE_REGIONS,
+        parse_request_id, parse_retry_after, reduce_failure_body, CodexCancellation,
+        CodexTransport, FailureBodyCollector, FailureJsonScanner, FAILURE_BODY_LIMIT,
+        FAILURE_JSON_MAX_DEPTH, FAILURE_JSON_MAX_FIELDS,
     };
     use crate::codex_auth::InferenceSecrets;
     use crate::provider_failure::{ErrorCode, ErrorParam, FailureObservation, RateKind};
@@ -1200,24 +1529,24 @@ mod tests {
     }
 
     #[test]
-    fn failure_body_budget_reserves_three_input_sized_regions() {
-        assert_eq!(FAILURE_BODY_VARIABLE_REGIONS, 3);
-        let admitted = failure_body_memory_budget(FAILURE_BODY_INPUT_LIMIT).unwrap();
-        let first_rejected = failure_body_memory_budget(FAILURE_BODY_INPUT_LIMIT + 1).unwrap();
-        assert!(admitted <= FAILURE_BODY_LIMIT);
-        assert!(first_rejected > FAILURE_BODY_LIMIT);
+    fn failure_projection_uses_only_fixed_or_borrowed_parser_state() {
+        assert!(!std::mem::needs_drop::<FailureJsonScanner<'static>>());
+        assert!(!std::mem::needs_drop::<FailureBodyCollector>());
+        assert!(
+            std::mem::size_of::<FailureJsonScanner<'static>>() <= 5 * std::mem::size_of::<usize>()
+        );
     }
 
     #[test]
     fn near_limit_late_escape_reduces_directly_to_closed_facts() {
         let prefix = br#"{"error":{"code":""#;
         let suffix = br#"\u0061","param":"tool_choice"}}"#;
-        let fill = FAILURE_BODY_INPUT_LIMIT - prefix.len() - suffix.len();
-        let mut body = Vec::with_capacity(FAILURE_BODY_INPUT_LIMIT);
+        let fill = FAILURE_BODY_LIMIT - prefix.len() - suffix.len();
+        let mut body = Vec::with_capacity(FAILURE_BODY_LIMIT);
         body.extend_from_slice(prefix);
         body.resize(body.len() + fill, b'x');
         body.extend_from_slice(suffix);
-        assert_eq!(body.len(), FAILURE_BODY_INPUT_LIMIT);
+        assert_eq!(body.len(), FAILURE_BODY_LIMIT);
 
         let facts = reduce_failure_body(&body);
 
@@ -1228,7 +1557,7 @@ mod tests {
     #[test]
     fn over_budget_failure_body_is_not_parsed_or_projected() {
         let mut body = br#"{"error":{"code":"unsupported_value","param":"tool_choice"}}"#.to_vec();
-        body.resize(FAILURE_BODY_INPUT_LIMIT + 1, b' ');
+        body.resize(FAILURE_BODY_LIMIT + 1, b' ');
 
         let facts = reduce_failure_body(&body);
 
@@ -1240,13 +1569,10 @@ mod tests {
     fn oversized_failure_frame_is_not_retained_or_parsed_by_the_caller() {
         let mut body = br#"{"error":{"code":"unsupported_value","param":"tool_choice"}}"#.to_vec();
         body.resize(FAILURE_BODY_LIMIT + 1, b' ');
-        let mut collector = FailureBodyCollector::new(Some(FAILURE_BODY_INPUT_LIMIT as u64))
+        let mut collector = FailureBodyCollector::new(Some(FAILURE_BODY_LIMIT as u64))
             .expect("the maximum bounded input must be admitted");
         assert!(!collector.retain(&body));
-        assert_eq!(collector.body.len(), 0);
-        assert!(
-            failure_body_memory_budget(collector.body.capacity()).unwrap() <= FAILURE_BODY_LIMIT
-        );
+        assert_eq!(collector.retained_len(), 0);
         assert!(FailureBodyCollector::new(Some(body.len() as u64)).is_none());
 
         let response = format!(
@@ -1282,5 +1608,60 @@ mod tests {
         );
         assert!(request_rx.recv().unwrap().starts_with(b"POST "));
         handle.join().unwrap();
+    }
+
+    #[test]
+    fn failure_projection_ignores_nested_unknown_data_without_retaining_it() {
+        let facts = reduce_failure_body(
+            br#"{"meta":{"error":{"code":"unsupported_value"},"items":[{"private":"x"}]},"error":{"unknown":{"deep":[true,null,{"secret":"y"}]},"type":"rate_limit_error","code":"rate_limit_exceeded","param":"other"}}"#,
+        );
+        assert_eq!(facts.rate_kind, Some(RateKind::RateLimit));
+        assert_eq!(facts.error_code, ErrorCode::RateLimitExceeded);
+        assert_eq!(facts.error_param, ErrorParam::Other);
+    }
+
+    #[test]
+    fn failure_projection_rejects_malformed_json_and_invalid_unicode_escapes() {
+        for body in [
+            br#"{"error":{"code":"unsupported_value",}}"#.as_slice(),
+            br#"{"error":{"code":"unsupported_value"}} trailing"#.as_slice(),
+            br#"{"error":{"code":"unsupported_\uD800value"}}"#.as_slice(),
+            br#"{"error":{"code":17}}"#.as_slice(),
+        ] {
+            assert_eq!(reduce_failure_body(body), super::EMPTY_FAILURE_BODY_FACTS);
+        }
+    }
+
+    #[test]
+    fn failure_projection_enforces_fixed_depth_and_field_limits() {
+        let mut at_depth = String::from("{\"unknown\":");
+        at_depth.push_str(&"[".repeat(FAILURE_JSON_MAX_DEPTH - 1));
+        at_depth.push_str("null");
+        at_depth.push_str(&"]".repeat(FAILURE_JSON_MAX_DEPTH - 1));
+        at_depth.push_str(",\"error\":{\"code\":\"unsupported_value\"}}");
+        assert_eq!(
+            reduce_failure_body(at_depth.as_bytes()).error_code,
+            ErrorCode::UnsupportedValue
+        );
+
+        let mut too_deep = String::from("{\"unknown\":");
+        too_deep.push_str(&"[".repeat(FAILURE_JSON_MAX_DEPTH));
+        too_deep.push_str("null");
+        too_deep.push_str(&"]".repeat(FAILURE_JSON_MAX_DEPTH));
+        too_deep.push_str(",\"error\":{\"code\":\"unsupported_value\"}}");
+        assert_eq!(
+            reduce_failure_body(too_deep.as_bytes()),
+            super::EMPTY_FAILURE_BODY_FACTS
+        );
+
+        let fields = (0..FAILURE_JSON_MAX_FIELDS)
+            .map(|index| format!("\"f{index}\":null"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let too_many = format!("{{{fields},\"error\":{{\"code\":\"unsupported_value\"}}}}");
+        assert_eq!(
+            reduce_failure_body(too_many.as_bytes()),
+            super::EMPTY_FAILURE_BODY_FACTS
+        );
     }
 }

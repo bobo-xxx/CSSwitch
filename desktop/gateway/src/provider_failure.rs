@@ -543,7 +543,9 @@ impl AttemptController {
     pub(crate) fn cancelled_diagnostic(&mut self) -> Result<AttemptDiagnostic, TransitionError> {
         if !matches!(
             self.phase,
-            AttemptPhase::UpstreamOpen | AttemptPhase::TerminalPending(AttemptOutcome::Cancelled)
+            AttemptPhase::UpstreamOpen
+                | AttemptPhase::TerminalPending(AttemptOutcome::Failed)
+                | AttemptPhase::TerminalPending(AttemptOutcome::Cancelled)
         ) {
             return Err(TransitionError::FinalizationNotAuthorized);
         }

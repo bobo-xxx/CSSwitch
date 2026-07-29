@@ -188,6 +188,22 @@ fn json_bytes(value: Value) -> Vec<u8> {
     serde_json::to_vec(&value).unwrap_or_else(|_| b"{\"error\":\"internal\"}".to_vec())
 }
 
+fn write_response_checked<W: Write>(
+    stream: &mut W,
+    status: u16,
+    reason: &str,
+    content_type: &str,
+    body: &[u8],
+) -> std::io::Result<()> {
+    write!(
+        stream,
+        "HTTP/1.1 {status} {reason}\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+        body.len()
+    )?;
+    stream.write_all(body)?;
+    stream.flush()
+}
+
 fn write_response(
     stream: &mut TcpStream,
     status: u16,
@@ -195,18 +211,21 @@ fn write_response(
     content_type: &str,
     body: &[u8],
 ) {
-    let _ = write!(
-        stream,
-        "HTTP/1.1 {status} {reason}\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
-        body.len()
-    );
-    let _ = stream.write_all(body);
-    let _ = stream.flush();
+    let _ = write_response_checked(stream, status, reason, content_type, body);
+}
+
+fn write_json_checked<W: Write>(
+    stream: &mut W,
+    status: u16,
+    reason: &str,
+    value: Value,
+) -> std::io::Result<()> {
+    let body = json_bytes(value);
+    write_response_checked(stream, status, reason, "application/json", &body)
 }
 
 fn write_json(stream: &mut TcpStream, status: u16, reason: &str, value: Value) {
-    let body = json_bytes(value);
-    write_response(stream, status, reason, "application/json", &body);
+    let _ = write_json_checked(stream, status, reason, value);
 }
 
 fn write_codex_models_response(
@@ -469,7 +488,7 @@ fn handle_get(
     }
 }
 
-fn write_chunk(stream: &mut TcpStream, chunk: &[u8]) -> std::io::Result<()> {
+fn write_chunk<W: Write>(stream: &mut W, chunk: &[u8]) -> std::io::Result<()> {
     write!(stream, "{:x}\r\n", chunk.len())?;
     stream.write_all(chunk)?;
     stream.write_all(b"\r\n")?;
@@ -905,10 +924,10 @@ where
         .map_err(|_| CodexPumpError::Protocol)
 }
 
-fn finish_codex_stream_error(stream: &mut TcpStream) {
-    let _ = write_chunk(stream, &stream_error_event("Codex upstream protocol error"));
-    let _ = stream.write_all(b"0\r\n\r\n");
-    let _ = stream.flush();
+fn finish_codex_stream_error<W: Write>(stream: &mut W) -> std::io::Result<()> {
+    write_chunk(stream, &stream_error_event("Codex upstream protocol error"))?;
+    stream.write_all(b"0\r\n\r\n")?;
+    stream.flush()
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -918,8 +937,8 @@ enum CodexStreamOutcome {
     Cancelled,
 }
 
-fn forward_codex_stream<R: Read>(
-    stream: &mut TcpStream,
+fn forward_codex_stream<W: Write, R: Read>(
+    stream: &mut W,
     mut upstream: R,
     reducer: &mut codex_protocol::ResponsesReducer<'_>,
 ) -> CodexStreamOutcome {
@@ -933,17 +952,20 @@ fn forward_codex_stream<R: Read>(
         return CodexStreamOutcome::Cancelled;
     }
     match pump_codex_stream(&mut upstream, reducer, |chunk| write_chunk(stream, chunk)) {
-        Ok(()) => {
-            let _ = stream.write_all(b"0\r\n\r\n");
-            let _ = stream.flush();
-            CodexStreamOutcome::Completed
-        }
+        Ok(()) => stream
+            .write_all(b"0\r\n\r\n")
+            .and_then(|_| stream.flush())
+            .map(|_| CodexStreamOutcome::Completed)
+            .unwrap_or(CodexStreamOutcome::Cancelled),
         Err(CodexPumpError::DownstreamWrite | CodexPumpError::Cancelled) => {
             CodexStreamOutcome::Cancelled
         }
         Err(CodexPumpError::UpstreamRead | CodexPumpError::Protocol) => {
-            finish_codex_stream_error(stream);
-            CodexStreamOutcome::Failed
+            if finish_codex_stream_error(stream).is_ok() {
+                CodexStreamOutcome::Failed
+            } else {
+                CodexStreamOutcome::Cancelled
+            }
         }
     }
 }
@@ -1105,18 +1127,44 @@ fn next_codex_correlation_id() -> crate::provider_failure::CorrelationId {
 fn write_provider_failure(
     stream: &mut TcpStream,
     failure: &crate::provider_failure::ProviderFailure,
-) {
-    write_json(
+) -> std::io::Result<()> {
+    write_json_checked(
         stream,
         failure.status(),
         status_reason(failure.status()),
         failure.anthropic_json(),
-    );
+    )
 }
 
 trait CodexAttemptRuntime {
     fn wait(&mut self, delay_ms: u64, cancellation: &codex_transport::CodexCancellation) -> bool;
     fn emit(&mut self, diagnostic: crate::provider_failure::AttemptDiagnostic);
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum CodexFinalOutcome {
+    Completed,
+    Failed(crate::provider_failure::ProviderFailure),
+    Cancelled,
+}
+
+fn finalize_codex_attempt(
+    controller: &mut crate::provider_failure::AttemptController,
+    runtime: &mut dyn CodexAttemptRuntime,
+    outcome: CodexFinalOutcome,
+) {
+    let diagnostic = match outcome {
+        CodexFinalOutcome::Completed => controller
+            .completed_diagnostic()
+            .expect("completed attempt finalizes exactly once"),
+        CodexFinalOutcome::Failed(failure) => controller
+            .failed_diagnostic(&failure)
+            .expect("failed attempt finalizes exactly once"),
+        CodexFinalOutcome::Cancelled => controller
+            .cancelled_diagnostic()
+            .expect("cancelled attempt finalizes exactly once"),
+    };
+    runtime.emit(diagnostic);
 }
 
 struct CodexAttemptHooks<'a, A> {
@@ -1271,28 +1319,28 @@ fn handle_codex_messages_with_policy_and_runtime(
                             controller
                                 .observe(crate::provider_failure::FailureObservation::Cancelled)
                                 .expect("cancellation is terminal");
-                            hooks.runtime.emit(
-                                controller
-                                    .cancelled_diagnostic()
-                                    .expect("cancelled attempt finalizes exactly once"),
+                            finalize_codex_attempt(
+                                &mut controller,
+                                hooks.runtime,
+                                CodexFinalOutcome::Cancelled,
                             );
                             return;
                         }
                     }
                     crate::provider_failure::AttemptDirective::Fail(failure) => {
-                        hooks.runtime.emit(
-                            controller
-                                .failed_diagnostic(&failure)
-                                .expect("failed attempt finalizes exactly once"),
-                        );
-                        write_provider_failure(stream, &failure);
+                        let outcome = if write_provider_failure(stream, &failure).is_ok() {
+                            CodexFinalOutcome::Failed(failure)
+                        } else {
+                            CodexFinalOutcome::Cancelled
+                        };
+                        finalize_codex_attempt(&mut controller, hooks.runtime, outcome);
                         return;
                     }
                     crate::provider_failure::AttemptDirective::Cancel => {
-                        hooks.runtime.emit(
-                            controller
-                                .cancelled_diagnostic()
-                                .expect("cancelled attempt finalizes exactly once"),
+                        finalize_codex_attempt(
+                            &mut controller,
+                            hooks.runtime,
+                            CodexFinalOutcome::Cancelled,
                         );
                         return;
                     }
@@ -1319,17 +1367,9 @@ fn handle_codex_messages_with_policy_and_runtime(
         &signer,
     );
     if is_stream {
-        match forward_codex_stream(stream, upstream, &mut reducer) {
-            CodexStreamOutcome::Completed => hooks.runtime.emit(
-                controller
-                    .completed_diagnostic()
-                    .expect("completed attempt finalizes exactly once"),
-            ),
-            CodexStreamOutcome::Cancelled => hooks.runtime.emit(
-                controller
-                    .cancelled_diagnostic()
-                    .expect("cancelled attempt finalizes exactly once"),
-            ),
+        let outcome = match forward_codex_stream(stream, upstream, &mut reducer) {
+            CodexStreamOutcome::Completed => CodexFinalOutcome::Completed,
+            CodexStreamOutcome::Cancelled => CodexFinalOutcome::Cancelled,
             CodexStreamOutcome::Failed => {
                 let directive = controller
                     .observe(crate::provider_failure::FailureObservation::Protocol(
@@ -1339,20 +1379,15 @@ fn handle_codex_messages_with_policy_and_runtime(
                 let crate::provider_failure::AttemptDirective::Fail(failure) = directive else {
                     panic!("response-started failure cannot replay");
                 };
-                hooks.runtime.emit(
-                    controller
-                        .failed_diagnostic(&failure)
-                        .expect("failed attempt finalizes exactly once"),
-                );
+                CodexFinalOutcome::Failed(failure)
             }
-        }
+        };
+        finalize_codex_attempt(&mut controller, hooks.runtime, outcome);
     } else {
         match collect_codex_nonstream(upstream, stream, &mut reducer) {
-            Err(CodexNonstreamError::DownstreamClosed) => hooks.runtime.emit(
-                controller
-                    .cancelled_diagnostic()
-                    .expect("cancelled attempt finalizes exactly once"),
-            ),
+            Err(CodexNonstreamError::DownstreamClosed) => {
+                finalize_codex_attempt(&mut controller, hooks.runtime, CodexFinalOutcome::Cancelled)
+            }
             Err(CodexNonstreamError::UpstreamRead | CodexNonstreamError::Protocol) => {
                 let directive = controller
                     .observe(crate::provider_failure::FailureObservation::Protocol(
@@ -1362,21 +1397,21 @@ fn handle_codex_messages_with_policy_and_runtime(
                 let crate::provider_failure::AttemptDirective::Fail(failure) = directive else {
                     panic!("response-started failure cannot replay");
                 };
-                hooks.runtime.emit(
-                    controller
-                        .failed_diagnostic(&failure)
-                        .expect("failed attempt finalizes exactly once"),
-                );
-                write_provider_failure(stream, &failure);
+                let outcome = if write_provider_failure(stream, &failure).is_ok() {
+                    CodexFinalOutcome::Failed(failure)
+                } else {
+                    CodexFinalOutcome::Cancelled
+                };
+                finalize_codex_attempt(&mut controller, hooks.runtime, outcome);
             }
             Ok(()) => match reducer.nonstream_response() {
                 Ok(response) => {
-                    write_json(stream, 200, "OK", response);
-                    hooks.runtime.emit(
-                        controller
-                            .completed_diagnostic()
-                            .expect("completed attempt finalizes exactly once"),
-                    );
+                    let outcome = if write_json_checked(stream, 200, "OK", response).is_ok() {
+                        CodexFinalOutcome::Completed
+                    } else {
+                        CodexFinalOutcome::Cancelled
+                    };
+                    finalize_codex_attempt(&mut controller, hooks.runtime, outcome);
                 }
                 Err(_) => {
                     let directive = controller
@@ -1387,12 +1422,12 @@ fn handle_codex_messages_with_policy_and_runtime(
                     let crate::provider_failure::AttemptDirective::Fail(failure) = directive else {
                         panic!("response-started failure cannot replay");
                     };
-                    hooks.runtime.emit(
-                        controller
-                            .failed_diagnostic(&failure)
-                            .expect("failed attempt finalizes exactly once"),
-                    );
-                    write_provider_failure(stream, &failure);
+                    let outcome = if write_provider_failure(stream, &failure).is_ok() {
+                        CodexFinalOutcome::Failed(failure)
+                    } else {
+                        CodexFinalOutcome::Cancelled
+                    };
+                    finalize_codex_attempt(&mut controller, hooks.runtime, outcome);
                 }
             },
         }
@@ -2448,13 +2483,15 @@ mod tests {
     };
     use super::{
         apply_dsml_nonstream, caller_allows_automatic_tool_choice, collect_codex_nonstream,
-        dsml_stream_filter, forward_stream_body, handle_codex_messages_with_catalog,
-        handle_codex_messages_with_policy_and_runtime, handle_codex_messages_with_secrets,
-        handle_post, map_codex_auth_error, openai_chat_reasoning_signer, pump_codex_stream,
-        stream_error_event, write_codex_models_response, CodexAttemptHooks, CodexAttemptRuntime,
-        CodexComponents, CodexNonstreamError, CodexPumpError, CodexRequestPolicy,
-        KimiServerToolFilter, ProductionCodexAttemptRuntime, RequestHead, RequestNonceGenerator,
-        StreamFilter, StreamTermination,
+        dsml_stream_filter, finalize_codex_attempt, forward_codex_stream, forward_stream_body,
+        handle_codex_messages_with_catalog, handle_codex_messages_with_policy_and_runtime,
+        handle_codex_messages_with_secrets, handle_post, map_codex_auth_error,
+        openai_chat_reasoning_signer, pump_codex_stream, stream_error_event,
+        write_codex_models_response, write_json_checked, CodexAttemptHooks, CodexAttemptRuntime,
+        CodexComponents, CodexFinalOutcome, CodexNonstreamError, CodexPumpError,
+        CodexRequestPolicy, CodexStreamOutcome, KimiServerToolFilter,
+        ProductionCodexAttemptRuntime, RequestHead, RequestNonceGenerator, StreamFilter,
+        StreamTermination,
     };
     use crate::codex_auth::{InferenceSecrets, OAuthErrorCode, OAuthFlowError};
     use crate::codex_models::CodexModelCatalog;
@@ -2465,6 +2502,171 @@ mod tests {
     use crate::models::RelayModelCache;
 
     struct FailingReader;
+
+    #[derive(Default)]
+    struct ScriptedDeliveryWriter {
+        bytes: Vec<u8>,
+        fail_on_bytes: Option<&'static [u8]>,
+        fail_flush_after_terminal: bool,
+        terminal_seen: bool,
+    }
+
+    impl Write for ScriptedDeliveryWriter {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            if self.fail_on_bytes.is_some_and(|pattern| {
+                buffer
+                    .windows(pattern.len())
+                    .any(|candidate| candidate == pattern)
+            }) {
+                return Err(Error::new(
+                    ErrorKind::BrokenPipe,
+                    "scripted terminal write failure",
+                ));
+            }
+            if buffer.windows(5).any(|candidate| candidate == b"0\r\n\r\n") {
+                self.terminal_seen = true;
+            }
+            self.bytes.extend_from_slice(buffer);
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            if self.fail_flush_after_terminal && self.terminal_seen {
+                return Err(Error::new(
+                    ErrorKind::BrokenPipe,
+                    "scripted terminal flush failure",
+                ));
+            }
+            Ok(())
+        }
+    }
+
+    fn opened_attempt_controller() -> crate::provider_failure::AttemptController {
+        let context = crate::provider_failure::RouteContext::codex(
+            crate::provider_failure::RouteMode::Responses,
+            crate::provider_failure::CorrelationId::new("terminal-delivery-test").unwrap(),
+        );
+        let mut controller = crate::provider_failure::AttemptController::new(context, false);
+        controller.begin_post().unwrap();
+        controller.mark_response_started().unwrap();
+        controller
+    }
+
+    fn assert_only_cancelled_after_terminal_delivery(outcome: CodexFinalOutcome) {
+        let diagnostics = Arc::new(Mutex::new(Vec::new()));
+        let mut runtime = CapturingAttemptRuntime {
+            diagnostics: Arc::clone(&diagnostics),
+        };
+        let mut controller = opened_attempt_controller();
+        finalize_codex_attempt(&mut controller, &mut runtime, outcome);
+        let diagnostics = diagnostics.lock().unwrap();
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0]["outcome"], "cancelled");
+        assert!(diagnostics[0].get("failure_class").is_none());
+    }
+
+    #[test]
+    fn codex_failed_final_nonstream_delivery_finalizes_only_cancelled() {
+        let mut writer = ScriptedDeliveryWriter {
+            fail_on_bytes: Some(b"HTTP/1.1"),
+            ..Default::default()
+        };
+        let delivery = write_json_checked(&mut writer, 200, "OK", json!({"type":"message"}));
+        assert!(delivery.is_err());
+        assert_only_cancelled_after_terminal_delivery(CodexFinalOutcome::Cancelled);
+    }
+
+    #[test]
+    fn codex_failed_provider_failure_delivery_replaces_pending_failed_with_cancelled() {
+        let context = crate::provider_failure::RouteContext::codex(
+            crate::provider_failure::RouteMode::Responses,
+            crate::provider_failure::CorrelationId::new("terminal-failure-test").unwrap(),
+        );
+        let mut controller = crate::provider_failure::AttemptController::new(context, false);
+        controller.begin_post().unwrap();
+        let directive = controller
+            .observe(crate::provider_failure::FailureObservation::Http {
+                status: 400,
+                rate_kind: None,
+                retry_after_seconds: None,
+                request_id: None,
+                error_code: crate::provider_failure::ErrorCode::Other,
+                error_param: crate::provider_failure::ErrorParam::Absent,
+            })
+            .unwrap();
+        let crate::provider_failure::AttemptDirective::Fail(failure) = directive else {
+            panic!("permanent rejection must fail")
+        };
+        let mut writer = ScriptedDeliveryWriter {
+            fail_on_bytes: Some(b"HTTP/1.1"),
+            ..Default::default()
+        };
+        assert!(write_json_checked(
+            &mut writer,
+            failure.status(),
+            "Bad Request",
+            failure.anthropic_json(),
+        )
+        .is_err());
+
+        let diagnostics = Arc::new(Mutex::new(Vec::new()));
+        let mut runtime = CapturingAttemptRuntime {
+            diagnostics: Arc::clone(&diagnostics),
+        };
+        finalize_codex_attempt(&mut controller, &mut runtime, CodexFinalOutcome::Cancelled);
+        let diagnostics = diagnostics.lock().unwrap();
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0]["outcome"], "cancelled");
+        assert!(diagnostics[0].get("failure_class").is_none());
+    }
+
+    #[test]
+    fn codex_failed_terminal_sse_error_delivery_finalizes_only_cancelled() {
+        let signer = ThinkingSigner::new(&[9_u8; 32]).unwrap();
+        let epoch = "ab".repeat(16);
+        let mut reducer = ResponsesReducer::new("gpt", &epoch, "cdcd", &signer);
+        let mut writer = ScriptedDeliveryWriter {
+            fail_on_bytes: Some(b"event: error"),
+            ..Default::default()
+        };
+        let outcome = forward_codex_stream(
+            &mut writer,
+            Cursor::new(b"data: not-json\n\n"),
+            &mut reducer,
+        );
+        assert_eq!(outcome, CodexStreamOutcome::Cancelled);
+        assert_only_cancelled_after_terminal_delivery(CodexFinalOutcome::Cancelled);
+    }
+
+    #[test]
+    fn codex_failed_stream_terminal_chunk_finalizes_only_cancelled() {
+        let signer = ThinkingSigner::new(&[9_u8; 32]).unwrap();
+        let epoch = "ab".repeat(16);
+        let mut reducer = ResponsesReducer::new("gpt", &epoch, "cdcd", &signer);
+        let mut writer = ScriptedDeliveryWriter {
+            fail_on_bytes: Some(b"0\r\n\r\n"),
+            ..Default::default()
+        };
+        let outcome =
+            forward_codex_stream(&mut writer, Cursor::new(complete_codex_sse()), &mut reducer);
+        assert_eq!(outcome, CodexStreamOutcome::Cancelled);
+        assert_only_cancelled_after_terminal_delivery(CodexFinalOutcome::Cancelled);
+    }
+
+    #[test]
+    fn codex_failed_stream_terminal_flush_finalizes_only_cancelled() {
+        let signer = ThinkingSigner::new(&[9_u8; 32]).unwrap();
+        let epoch = "ab".repeat(16);
+        let mut reducer = ResponsesReducer::new("gpt", &epoch, "cdcd", &signer);
+        let mut writer = ScriptedDeliveryWriter {
+            fail_flush_after_terminal: true,
+            ..Default::default()
+        };
+        let outcome =
+            forward_codex_stream(&mut writer, Cursor::new(complete_codex_sse()), &mut reducer);
+        assert_eq!(outcome, CodexStreamOutcome::Cancelled);
+        assert_only_cancelled_after_terminal_delivery(CodexFinalOutcome::Cancelled);
+    }
 
     #[test]
     fn safe_repair_caller_eligibility_is_closed_to_absent_or_auto() {
