@@ -347,9 +347,11 @@ impl ProviderFailure {
     pub(crate) fn status(&self) -> u16 {
         self.status
     }
+    #[cfg(test)]
     pub(crate) fn failure_class(&self) -> FailureClass {
         self.failure_class
     }
+    #[cfg(test)]
     pub(crate) fn retryable(&self) -> bool {
         self.retryable
     }

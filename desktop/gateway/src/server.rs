@@ -1119,6 +1119,11 @@ trait CodexAttemptRuntime {
     fn emit(&mut self, diagnostic: crate::provider_failure::AttemptDiagnostic);
 }
 
+struct CodexAttemptHooks<'a, A> {
+    auth_rejected: A,
+    runtime: &'a mut dyn CodexAttemptRuntime,
+}
+
 struct ProductionCodexAttemptRuntime;
 
 impl CodexAttemptRuntime for ProductionCodexAttemptRuntime {
@@ -1148,7 +1153,7 @@ fn handle_codex_messages_with_policy(
     secrets: codex_auth::InferenceSecrets,
     transport: &codex_transport::CodexTransport,
     policy: CodexRequestPolicy<'_>,
-    mut auth_rejected: impl FnMut(u16, u64),
+    auth_rejected: impl FnMut(u16, u64),
 ) {
     let mut runtime = ProductionCodexAttemptRuntime;
     handle_codex_messages_with_policy_and_runtime(
@@ -1158,8 +1163,10 @@ fn handle_codex_messages_with_policy(
         secrets,
         transport,
         policy,
-        &mut auth_rejected,
-        &mut runtime,
+        CodexAttemptHooks {
+            auth_rejected,
+            runtime: &mut runtime,
+        },
     );
 }
 
@@ -1170,8 +1177,7 @@ fn handle_codex_messages_with_policy_and_runtime(
     secrets: codex_auth::InferenceSecrets,
     transport: &codex_transport::CodexTransport,
     policy: CodexRequestPolicy<'_>,
-    mut auth_rejected: impl FnMut(u16, u64),
-    runtime: &mut dyn CodexAttemptRuntime,
+    mut hooks: CodexAttemptHooks<'_, impl FnMut(u16, u64)>,
 ) {
     let target_model = match raw.get("model").and_then(Value::as_str) {
         Some(model) if !model.trim().is_empty() => model,
@@ -1254,28 +1260,28 @@ fn handle_codex_messages_with_policy_and_runtime(
             }
             Err(error) => {
                 if let Some(status @ (401 | 403)) = error.upstream_status {
-                    auth_rejected(status, generation);
+                    (hooks.auth_rejected)(status, generation);
                 }
                 match controller
                     .observe(error.observation())
                     .expect("in-flight Codex observation is authorized")
                 {
                     crate::provider_failure::AttemptDirective::RetryAfter(delay_ms) => {
-                        if !runtime.wait(delay_ms, &cancellation) {
+                        if !hooks.runtime.wait(delay_ms, &cancellation) {
                             controller
                                 .observe(crate::provider_failure::FailureObservation::Cancelled)
                                 .expect("cancellation is terminal");
-                            runtime.emit(controller.cancelled_diagnostic());
+                            hooks.runtime.emit(controller.cancelled_diagnostic());
                             return;
                         }
                     }
                     crate::provider_failure::AttemptDirective::Fail(failure) => {
-                        runtime.emit(controller.failed_diagnostic(&failure));
+                        hooks.runtime.emit(controller.failed_diagnostic(&failure));
                         write_provider_failure(stream, &failure);
                         return;
                     }
                     crate::provider_failure::AttemptDirective::Cancel => {
-                        runtime.emit(controller.cancelled_diagnostic());
+                        hooks.runtime.emit(controller.cancelled_diagnostic());
                         return;
                     }
                     crate::provider_failure::AttemptDirective::RepairOnce(
@@ -1302,8 +1308,8 @@ fn handle_codex_messages_with_policy_and_runtime(
     );
     if is_stream {
         match forward_codex_stream(stream, upstream, &mut reducer) {
-            CodexStreamOutcome::Completed => runtime.emit(controller.completed_diagnostic()),
-            CodexStreamOutcome::Cancelled => runtime.emit(controller.cancelled_diagnostic()),
+            CodexStreamOutcome::Completed => hooks.runtime.emit(controller.completed_diagnostic()),
+            CodexStreamOutcome::Cancelled => hooks.runtime.emit(controller.cancelled_diagnostic()),
             CodexStreamOutcome::Failed => {
                 let directive = controller
                     .observe(crate::provider_failure::FailureObservation::Protocol(
@@ -1313,13 +1319,13 @@ fn handle_codex_messages_with_policy_and_runtime(
                 let crate::provider_failure::AttemptDirective::Fail(failure) = directive else {
                     panic!("response-started failure cannot replay");
                 };
-                runtime.emit(controller.failed_diagnostic(&failure));
+                hooks.runtime.emit(controller.failed_diagnostic(&failure));
             }
         }
     } else {
         match collect_codex_nonstream(upstream, stream, &mut reducer) {
             Err(CodexNonstreamError::DownstreamClosed) => {
-                runtime.emit(controller.cancelled_diagnostic())
+                hooks.runtime.emit(controller.cancelled_diagnostic())
             }
             Err(CodexNonstreamError::UpstreamRead | CodexNonstreamError::Protocol) => {
                 let directive = controller
@@ -1330,13 +1336,13 @@ fn handle_codex_messages_with_policy_and_runtime(
                 let crate::provider_failure::AttemptDirective::Fail(failure) = directive else {
                     panic!("response-started failure cannot replay");
                 };
-                runtime.emit(controller.failed_diagnostic(&failure));
+                hooks.runtime.emit(controller.failed_diagnostic(&failure));
                 write_provider_failure(stream, &failure);
             }
             Ok(()) => match reducer.nonstream_response() {
                 Ok(response) => {
                     write_json(stream, 200, "OK", response);
-                    runtime.emit(controller.completed_diagnostic());
+                    hooks.runtime.emit(controller.completed_diagnostic());
                 }
                 Err(_) => {
                     let directive = controller
@@ -1347,7 +1353,7 @@ fn handle_codex_messages_with_policy_and_runtime(
                     let crate::provider_failure::AttemptDirective::Fail(failure) = directive else {
                         panic!("response-started failure cannot replay");
                     };
-                    runtime.emit(controller.failed_diagnostic(&failure));
+                    hooks.runtime.emit(controller.failed_diagnostic(&failure));
                     write_provider_failure(stream, &failure);
                 }
             },
@@ -2407,10 +2413,10 @@ mod tests {
         dsml_stream_filter, forward_stream_body, handle_codex_messages_with_catalog,
         handle_codex_messages_with_policy_and_runtime, handle_codex_messages_with_secrets,
         handle_post, map_codex_auth_error, openai_chat_reasoning_signer, pump_codex_stream,
-        stream_error_event, write_codex_models_response, CodexAttemptRuntime, CodexComponents,
-        CodexNonstreamError, CodexPumpError, CodexRequestPolicy, KimiServerToolFilter,
-        ProductionCodexAttemptRuntime, RequestHead, RequestNonceGenerator, StreamFilter,
-        StreamTermination,
+        stream_error_event, write_codex_models_response, CodexAttemptHooks, CodexAttemptRuntime,
+        CodexComponents, CodexNonstreamError, CodexPumpError, CodexRequestPolicy,
+        KimiServerToolFilter, ProductionCodexAttemptRuntime, RequestHead, RequestNonceGenerator,
+        StreamFilter, StreamTermination,
     };
     use crate::codex_auth::{InferenceSecrets, OAuthErrorCode, OAuthFlowError};
     use crate::codex_models::CodexModelCatalog;
@@ -3539,8 +3545,10 @@ mod tests {
                     InferenceSecrets::for_test("access", "account"),
                     &transport,
                     CodexRequestPolicy::default(),
-                    |_, _| panic!("cancelled request must not reject auth"),
-                    &mut runtime,
+                    CodexAttemptHooks {
+                        auth_rejected: |_, _| panic!("cancelled request must not reject auth"),
+                        runtime: &mut runtime,
+                    },
                 );
                 handler_done_tx.send(()).unwrap();
             });
@@ -3649,7 +3657,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let root = std::path::PathBuf::from("/private/tmp").join(format!(
+        let root = std::env::temp_dir().join(format!(
             "csswitch-bridge-{label}-{}-{suffix}",
             std::process::id()
         ));
@@ -3765,7 +3773,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let root = std::path::PathBuf::from("/private/tmp").join(format!(
+        let root = std::env::temp_dir().join(format!(
             "csswitch-bridge-reader-{}-{suffix}",
             std::process::id()
         ));

@@ -9,7 +9,8 @@ use std::time::Duration;
 use serde_json::Value;
 
 use super::{
-    handle_codex_messages_with_policy_and_runtime, CodexAttemptRuntime, CodexRequestPolicy,
+    handle_codex_messages_with_policy_and_runtime, CodexAttemptHooks, CodexAttemptRuntime,
+    CodexRequestPolicy,
 };
 use crate::codex_auth::InferenceSecrets;
 use crate::codex_transport::{CodexCancellation, CodexTransport};
@@ -691,13 +692,15 @@ fn run_case_with_runtime(
                 use_responses_lite: case.use_responses_lite,
                 ..CodexRequestPolicy::default()
             },
-            |status, _generation| {
-                auth_rejections_for_handler
-                    .lock()
-                    .expect("lock auth rejections")
-                    .push(status);
+            CodexAttemptHooks {
+                auth_rejected: |status, _generation| {
+                    auth_rejections_for_handler
+                        .lock()
+                        .expect("lock auth rejections")
+                        .push(status);
+                },
+                runtime: &mut runtime,
             },
-            &mut runtime,
         );
     });
     let script = upstream.finish();
@@ -1180,8 +1183,10 @@ fn attempt_wait_cancellation_emits_one_final_diagnostic_without_replay() {
             InferenceSecrets::for_test(ACCESS_SENTINEL, ACCOUNT_SENTINEL),
             &transport,
             CodexRequestPolicy::default(),
-            |_status, _generation| {},
-            &mut runtime,
+            CodexAttemptHooks {
+                auth_rejected: |_status, _generation| {},
+                runtime: &mut runtime,
+            },
         );
     });
     let script = upstream.finish();
