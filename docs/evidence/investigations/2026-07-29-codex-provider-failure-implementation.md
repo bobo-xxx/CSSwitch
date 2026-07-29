@@ -1,6 +1,6 @@
 # Codex Provider Failure Contract Implementation Evidence
 
-Date: 2026-07-29
+Date: 2026-07-30
 
 ## Scope
 
@@ -8,7 +8,7 @@ Ticket 05 implements the Provider Failure Contract through the real Codex handle
 
 ## Revision and environment
 
-The implementation was tested from a clean worktree at revision `714ee06e05fe3b9cac3821095476f35995b3e301` before this evidence-only commit. The literal revision and environment commands and outputs were:
+The final-review-remediated implementation was tested from a clean worktree at revision `6ea1450d5db7a0f0bb1ef15b9d5067d06d058aad` before this evidence-only commit. The literal revision and environment commands and outputs were:
 
 ```text
 $ git status --short
@@ -16,7 +16,7 @@ $ git status --short
 exit 0
 
 $ git rev-parse HEAD
-714ee06e05fe3b9cac3821095476f35995b3e301
+6ea1450d5db7a0f0bb1ef15b9d5067d06d058aad
 exit 0
 
 $ rustc --version
@@ -55,7 +55,7 @@ exit 0
 
 ```text
 $ cargo test --offline --manifest-path desktop/gateway/Cargo.toml provider_failure::tests -- --test-threads=1
-lib: 11 passed; 0 failed; 0 ignored; 0 measured; 289 filtered out
+lib: 12 passed; 0 failed; 0 ignored; 0 measured; 290 filtered out
 main: 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 codex_auth_cli: 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out
 exit 0
@@ -63,7 +63,7 @@ exit 0
 
 ```text
 $ cargo test --offline --manifest-path desktop/gateway/Cargo.toml codex_transport::tests -- --test-threads=1
-lib: 11 passed; 0 failed; 0 ignored; 0 measured; 289 filtered out
+lib: 12 passed; 0 failed; 0 ignored; 0 measured; 290 filtered out
 main: 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 codex_auth_cli: 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out
 exit 0
@@ -71,7 +71,7 @@ exit 0
 
 ```text
 $ cargo test --offline --manifest-path desktop/gateway/Cargo.toml --features acceptance-build 'server::codex_acceptance::harness_' -- --nocapture --test-threads=1
-lib: 8 passed; 0 failed; 0 ignored; 0 measured; 329 filtered out
+lib: 8 passed; 0 failed; 0 ignored; 0 measured; 331 filtered out
 main: 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 codex_auth_cli: 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out
 exit 0
@@ -79,7 +79,7 @@ exit 0
 
 ```text
 $ cargo test --offline --manifest-path desktop/gateway/Cargo.toml --features acceptance-build 'server::codex_acceptance::contract_' -- --nocapture --test-threads=1
-lib: 27 passed; 0 failed; 0 ignored; 0 measured; 310 filtered out
+lib: 27 passed; 0 failed; 0 ignored; 0 measured; 312 filtered out
 main: 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 codex_auth_cli: 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out
 exit 0
@@ -87,7 +87,7 @@ exit 0
 
 ```text
 $ cargo test --offline --manifest-path desktop/gateway/Cargo.toml codex_ -- --test-threads=1
-lib: 154 passed; 0 failed; 0 ignored; 0 measured; 146 filtered out
+lib: 155 passed; 0 failed; 0 ignored; 0 measured; 147 filtered out
 main: 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 codex_auth_cli: 1 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out
 exit 0
@@ -95,7 +95,7 @@ exit 0
 
 ```text
 $ cargo test --offline --manifest-path desktop/gateway/Cargo.toml --all-features -- --test-threads=1
-lib: 337 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+lib: 339 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 main: 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 codex_auth_cli: 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 doc tests: 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
@@ -115,7 +115,7 @@ Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.15s
 exit 0; no warnings
 ```
 
-The accepted harness passes 8/8, the accepted Provider Failure Contract passes 27/27, and the non-contract attempt integrations pass 2/2.
+The accepted harness passes 8/8, the accepted Provider Failure Contract passes 27/27, and the non-contract attempt integrations pass 2/2. The pure controller suite passes 12/12 and the transport suite passes 12/12.
 
 ## Behavioral evidence
 
@@ -127,11 +127,16 @@ The accepted harness passes 8/8, the accepted Provider Failure Contract passes 2
 - Permanent 4xx, authentication, authorization, and quota failures do not replay.
 - No replay occurs after an upstream response opens or downstream bytes begin.
 - Every started attempt sequence emits one final `completed`, `failed`, or `cancelled` diagnostic.
+- Final diagnostic construction is checked and single-use: duplicate finalization and phase-incompatible outcomes return `FinalizationNotAuthorized` rather than overwriting terminal state or constructing a second diagnostic.
 
 ## Redaction boundary
 
 Caller envelopes preserve legacy Anthropic fields and add only closed structured metadata. Diagnostics contain only outcome, provider, route, correlation ID, POST/repair/delay counts, and failure-only mapped status, optional upstream status, class, and retryability. Request IDs are positive-allowlisted for caller output but excluded from diagnostics. Raw bodies, prompts, credentials, account identifiers, cookies, headers, and private URLs cannot enter the controller or diagnostic types.
 
+Failed-body projection now admits body collection only when reqwest exposes a validated `Content-Length` and the entire declared body fits a caller-owned memory budget below 16 KiB. That budget reserves equal worst-case storage for decoded allowlisted strings plus fixed typed facts, so retained input plus parsed output stays within 16 KiB. Unknown-length, invalid-length, and oversized bodies are not polled by CSSwitch and conservatively project no body-derived facts. The parser borrows normal strings, owns only escaped values for `error.type`, `error.code`, and `error.param`, ignores all other fields, and immediately reduces those values to closed enums.
+
 ## Explicit limitations
 
 This evidence does not verify an installed runtime or live Codex subscription; Ticket 06 owns that work. It does not add the shared API-key adapter; Ticket 07 owns that work. No macOS runtime was available, so macOS source compatibility is covered by the shared Rust build/test surface rather than a real macOS run.
+
+Reqwest exposes already-materialized `Bytes` frames and does not provide a caller-sized read API for `Response::chunk()`. CSSwitch therefore enforces the strict bound at its caller-owned admission and retention boundary; it does not claim to observe or cap private reqwest/hyper socket buffers or allocations that may occur while response headers are produced. The focused oversized-frame test proves the collector retains zero bytes from a frame larger than 16 KiB and that an oversized declared loopback response yields no parsed capability facts.
