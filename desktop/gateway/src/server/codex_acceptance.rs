@@ -829,8 +829,11 @@ fn contract_failure_schema_and_caller_redaction() {
         is_stream: false,
         use_responses_lite: false,
         endpoint_path: "/PRIVATE_UPSTREAM_PATH_SENTINEL/responses",
-        steps: vec![redaction_step()],
+        steps: vec![redaction_step(), redaction_step(), redaction_step()],
     });
+    assert_eq!(result.script.requests.len(), 3);
+    assert_eq!(result.script.remaining_steps, 0);
+    assert_eq!(result.script.unexpected_posts, 0);
     let raw = result.text();
     assert_forbidden_sentinels_absent(&raw);
     assert_failure_envelope(
@@ -1246,20 +1249,30 @@ fn contract_unproven_error_text_does_not_authorize_repair() {
     assert_eq!(result.script.unexpected_posts, 0);
 }
 
+fn invalid_request_id_step(request_id: &str) -> UpstreamStep {
+    UpstreamStep::json_with_headers(
+        500,
+        "Internal Server Error",
+        serde_json::json!({"error":{"code":"synthetic_transient"}}),
+        vec![("x-request-id", request_id)],
+    )
+}
+
 fn assert_invalid_request_id_is_omitted(request_id: &str) {
     let result = run_case(AcceptanceCase {
         request: anthropic_request(false),
         is_stream: false,
         use_responses_lite: false,
         endpoint_path: "/responses",
-        steps: vec![UpstreamStep::json_with_headers(
-            500,
-            "Internal Server Error",
-            serde_json::json!({"error":{"code":"synthetic_transient"}}),
-            vec![("x-request-id", request_id)],
-        )],
+        steps: vec![
+            invalid_request_id_step(request_id),
+            invalid_request_id_step(request_id),
+            invalid_request_id_step(request_id),
+        ],
     });
-    assert_eq!(result.script.requests.len(), 1);
+    assert_eq!(result.script.requests.len(), 3);
+    assert_eq!(result.script.remaining_steps, 0);
+    assert_eq!(result.script.unexpected_posts, 0);
     assert_optional_metadata_absent(&result, &["request_id", "retry_after_seconds"]);
     assert_failure_envelope(
         &result,
