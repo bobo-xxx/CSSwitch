@@ -271,7 +271,13 @@ fn write_step(stream: &mut TcpStream, step: UpstreamStep) {
     }
 }
 
-fn manual_post(address: SocketAddr, body: Value) {
+fn manual_post(address: SocketAddr, body: Value) -> Vec<u8> {
+    let response = manual_post_raw(address, body);
+    assert!(response.starts_with(b"HTTP/1.1"));
+    response
+}
+
+fn manual_post_raw(address: SocketAddr, body: Value) -> Vec<u8> {
     let body = serde_json::to_vec(&body).expect("serialize manual request");
     let mut stream = TcpStream::connect(address).expect("connect manual client");
     write!(
@@ -286,7 +292,7 @@ fn manual_post(address: SocketAddr, body: Value) {
     stream
         .read_to_end(&mut response)
         .expect("read manual response");
-    assert!(response.starts_with(b"HTTP/1.1"));
+    response
 }
 
 #[test]
@@ -337,4 +343,56 @@ fn harness_reports_unused_and_extra_script_steps() {
     let extra_result = extra.finish();
     assert_eq!(extra_result.remaining_steps, 0);
     assert_eq!(extra_result.unexpected_posts, 1);
+}
+
+#[test]
+fn harness_serves_sse_disconnect_and_partial_responses() {
+    let complete_body = b"data: complete\n\n".to_vec();
+    let partial_body = b"data: partial\n\n".to_vec();
+    let upstream = ScriptedCodexUpstream::start(vec![
+        UpstreamStep::Sse(complete_body.clone()),
+        UpstreamStep::Disconnect,
+        UpstreamStep::PartialSseThenDrop(partial_body.clone()),
+    ]);
+    assert_eq!(
+        upstream.endpoint("/responses"),
+        format!("http://{}/responses", upstream.address())
+    );
+
+    let complete_response = manual_post(upstream.address(), serde_json::json!({"attempt": 1}));
+    let complete_head_end = complete_response
+        .windows(4)
+        .position(|part| part == b"\r\n\r\n")
+        .expect("complete SSE response head");
+    let complete_head = String::from_utf8_lossy(&complete_response[..complete_head_end]);
+    let complete_length = format!("content-length: {}", complete_body.len());
+    assert!(complete_head.starts_with("HTTP/1.1 200 OK\r\n"));
+    assert!(complete_head.contains("content-type: text/event-stream\r\n"));
+    assert!(complete_head.contains(&complete_length));
+    assert_eq!(&complete_response[complete_head_end + 4..], complete_body);
+
+    let disconnect_response =
+        manual_post_raw(upstream.address(), serde_json::json!({"attempt": 2}));
+    assert!(disconnect_response.is_empty());
+
+    let partial_response = manual_post(upstream.address(), serde_json::json!({"attempt": 3}));
+    let partial_head_end = partial_response
+        .windows(4)
+        .position(|part| part == b"\r\n\r\n")
+        .expect("partial SSE response head");
+    let partial_head = String::from_utf8_lossy(&partial_response[..partial_head_end]);
+    let declared_partial_length = format!("content-length: {}", partial_body.len() + 128);
+    assert!(partial_head.starts_with("HTTP/1.1 200 OK\r\n"));
+    assert!(partial_head.contains("content-type: text/event-stream\r\n"));
+    assert!(partial_head.contains(&declared_partial_length));
+    assert_eq!(&partial_response[partial_head_end + 4..], partial_body);
+
+    let result = upstream.finish();
+    assert_eq!(result.requests.len(), 3);
+    assert_eq!(result.remaining_steps, 0);
+    assert_eq!(result.unexpected_posts, 0);
+    for request in result.requests {
+        assert!(!request.headers.contains_key("authorization"));
+        assert!(!request.headers.contains_key("chatgpt-account-id"));
+    }
 }
