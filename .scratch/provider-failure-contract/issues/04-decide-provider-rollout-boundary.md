@@ -1,7 +1,7 @@
 # Decide the provider rollout boundary
 
 Type: grilling
-Status: open
+Status: claimed
 Blocked by: 02, 03
 
 ## Question
