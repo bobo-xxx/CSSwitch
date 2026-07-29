@@ -1,0 +1,420 @@
+use std::fmt;
+
+use serde::Serialize;
+use serde_json::{json, Value};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ProviderId {
+    Codex,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum RouteMode {
+    Responses,
+    ResponsesLite,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
+pub(crate) struct CorrelationId(String);
+
+impl CorrelationId {
+    pub(crate) fn new(value: impl Into<String>) -> Option<Self> {
+        let value = value.into();
+        RequestId::is_valid(&value).then_some(Self(value))
+    }
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RequestId(String);
+
+impl RequestId {
+    pub(crate) fn new(value: &str) -> Option<Self> {
+        Self::is_valid(value).then(|| Self(value.to_owned()))
+    }
+    fn is_valid(value: &str) -> bool {
+        !value.is_empty()
+            && value.len() <= 256
+            && value.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':')
+            })
+    }
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RetryPolicy {
+    pub(crate) max_posts: u8,
+    pub(crate) fallback_delays_ms: [u64; 2],
+    pub(crate) retry_after_cap_seconds: u64,
+}
+
+impl RetryPolicy {
+    pub(crate) const CODEX: Self = Self {
+        max_posts: 3,
+        fallback_delays_ms: [500, 1_000],
+        retry_after_cap_seconds: 60,
+    };
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RouteContext {
+    pub(crate) provider: ProviderId,
+    pub(crate) route: RouteMode,
+    pub(crate) correlation_id: CorrelationId,
+    pub(crate) retry_policy: RetryPolicy,
+}
+
+impl RouteContext {
+    pub(crate) fn codex(route: RouteMode, correlation_id: CorrelationId) -> Self {
+        Self {
+            provider: ProviderId::Codex,
+            route,
+            correlation_id,
+            retry_policy: RetryPolicy::CODEX,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RateKind {
+    RateLimit,
+    Quota,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ErrorCode {
+    Absent,
+    UnsupportedValue,
+    InsufficientQuota,
+    RateLimitExceeded,
+    Other,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ErrorParam {
+    Absent,
+    ToolChoice,
+    Other,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NetworkKind {
+    Connect,
+    Timeout,
+    Read,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ProtocolKind {
+    InvalidResponse,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum FailureObservation {
+    Http {
+        status: u16,
+        rate_kind: Option<RateKind>,
+        retry_after_seconds: Option<u64>,
+        request_id: Option<RequestId>,
+        error_code: ErrorCode,
+        error_param: ErrorParam,
+    },
+    Network(NetworkKind),
+    Protocol(ProtocolKind),
+    Cancelled,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum FailureClass {
+    Authentication,
+    Authorization,
+    InvalidRequest,
+    Capability,
+    Quota,
+    RateLimit,
+    Transient,
+    Network,
+    Protocol,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum AttemptOutcome {
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct ProviderFailure {
+    status: u16,
+    error_type: &'static str,
+    message: &'static str,
+    context: RouteContext,
+    failure_class: FailureClass,
+    upstream_status: Option<u16>,
+    retryable: bool,
+    recovery: &'static str,
+    request_id: Option<RequestId>,
+    retry_after_seconds: Option<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub(crate) struct AttemptDiagnostic {
+    outcome: AttemptOutcome,
+    provider: ProviderId,
+    route: RouteMode,
+    correlation_id: CorrelationId,
+    posts: u8,
+    repairs: u8,
+    delays_ms: Vec<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mapped_status: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    upstream_status: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    failure_class: Option<FailureClass>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    retryable: Option<bool>,
+}
+
+impl ProviderFailure {
+    pub(crate) fn from_observation(
+        context: &RouteContext,
+        observation: &FailureObservation,
+        exhausted: bool,
+    ) -> Self {
+        let (upstream_status, request_id, retry_after_seconds) = match observation {
+            FailureObservation::Http {
+                status,
+                request_id,
+                retry_after_seconds,
+                ..
+            } => (Some(*status), request_id.clone(), *retry_after_seconds),
+            FailureObservation::Network(_) | FailureObservation::Protocol(_) => (None, None, None),
+            FailureObservation::Cancelled => unreachable!("cancellation has no caller failure"),
+        };
+        let (status, error_type, message, failure_class, retryable, recovery) = match observation {
+            FailureObservation::Http { status: 401, .. } => (
+                401,
+                "authentication_error",
+                "Provider authentication failed",
+                FailureClass::Authentication,
+                false,
+                "Re-authenticate, then start a new caller request",
+            ),
+            FailureObservation::Http { status: 403, .. } => (
+                403,
+                "permission_error",
+                "Provider authorization failed",
+                FailureClass::Authorization,
+                false,
+                "Check account, workspace, geography, and model entitlement",
+            ),
+            FailureObservation::Http {
+                status: 400,
+                error_code: ErrorCode::UnsupportedValue,
+                ..
+            }
+            | FailureObservation::Http {
+                status: 400,
+                error_param: ErrorParam::ToolChoice,
+                ..
+            } => (
+                400,
+                "invalid_request_error",
+                "Provider Route cannot preserve this request",
+                FailureClass::Capability,
+                false,
+                "Use equivalent supported request semantics or select a compatible model",
+            ),
+            FailureObservation::Http {
+                status: 429,
+                rate_kind: Some(RateKind::Quota),
+                ..
+            } => (
+                429,
+                "rate_limit_error",
+                "Provider quota prevents this request",
+                FailureClass::Quota,
+                false,
+                "Restore account quota before starting a new request",
+            ),
+            FailureObservation::Http {
+                status: 429,
+                rate_kind: Some(RateKind::RateLimit),
+                ..
+            } => (
+                429,
+                "rate_limit_error",
+                "Provider rate limit prevents this request",
+                FailureClass::RateLimit,
+                exhausted,
+                "Wait for rate capacity before starting a new request",
+            ),
+            FailureObservation::Http { status: 429, .. } => (
+                429,
+                "rate_limit_error",
+                "Provider rate limit prevents this request",
+                FailureClass::RateLimit,
+                false,
+                "Wait for rate capacity before starting a new request",
+            ),
+            FailureObservation::Http { status: 408, .. } => (
+                504,
+                "api_error",
+                "Provider transient failure exhausted retry budget",
+                FailureClass::Transient,
+                exhausted,
+                "Start a new request after the provider recovers",
+            ),
+            FailureObservation::Http {
+                status: 409 | 500..=599,
+                ..
+            } => (
+                502,
+                "api_error",
+                "Provider transient failure exhausted retry budget",
+                FailureClass::Transient,
+                exhausted,
+                "Start a new request after the provider recovers",
+            ),
+            FailureObservation::Http { status, .. } if (400..=499).contains(status) => (
+                *status,
+                "invalid_request_error",
+                "Provider rejected the request",
+                FailureClass::InvalidRequest,
+                false,
+                "Correct the request or select a compatible model",
+            ),
+            FailureObservation::Http { .. } => (
+                502,
+                "api_error",
+                "Provider returned an unsupported status",
+                FailureClass::Protocol,
+                false,
+                "Inspect sanitized diagnostics and start a new request",
+            ),
+            FailureObservation::Network(NetworkKind::Timeout) => (
+                504,
+                "api_error",
+                "Provider network failure exhausted retry budget",
+                FailureClass::Network,
+                exhausted,
+                "Check the network route before starting a new request",
+            ),
+            FailureObservation::Network(NetworkKind::Connect | NetworkKind::Read) => (
+                502,
+                "api_error",
+                "Provider network failure exhausted retry budget",
+                FailureClass::Network,
+                exhausted,
+                "Check the network route before starting a new request",
+            ),
+            FailureObservation::Protocol(ProtocolKind::InvalidResponse) => (
+                502,
+                "api_error",
+                "Provider response violated the expected protocol",
+                FailureClass::Protocol,
+                false,
+                "Inspect sanitized diagnostics and start a new request",
+            ),
+            FailureObservation::Cancelled => unreachable!("cancellation has no caller failure"),
+        };
+        Self {
+            status,
+            error_type,
+            message,
+            context: context.clone(),
+            failure_class,
+            upstream_status,
+            retryable,
+            recovery,
+            request_id,
+            retry_after_seconds,
+        }
+    }
+
+    pub(crate) fn status(&self) -> u16 {
+        self.status
+    }
+    pub(crate) fn failure_class(&self) -> FailureClass {
+        self.failure_class
+    }
+    pub(crate) fn retryable(&self) -> bool {
+        self.retryable
+    }
+
+    pub(crate) fn anthropic_json(&self) -> Value {
+        let mut error = json!({
+            "type": self.error_type,
+            "message": self.message,
+            "provider": self.context.provider,
+            "route": self.context.route,
+            "failure_class": self.failure_class,
+            "retryable": self.retryable,
+            "correlation_id": self.context.correlation_id.as_str(),
+            "recovery": self.recovery,
+        });
+        if let Some(status) = self.upstream_status {
+            error["upstream_status"] = json!(status);
+        }
+        if let Some(request_id) = &self.request_id {
+            error["request_id"] = json!(request_id.as_str());
+        }
+        if let Some(seconds) = self.retry_after_seconds {
+            error["retry_after_seconds"] = json!(seconds.min(60));
+        }
+        json!({ "type": "error", "error": error })
+    }
+}
+
+impl fmt::Debug for ProviderFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ProviderFailure")
+            .field("status", &self.status)
+            .field("error_type", &self.error_type)
+            .field("failure_class", &self.failure_class)
+            .field("upstream_status", &self.upstream_status)
+            .field("retryable", &self.retryable)
+            .field("correlation_id", &self.context.correlation_id.as_str())
+            .finish()
+    }
+}
+
+impl AttemptDiagnostic {
+    pub(crate) fn failed(
+        context: &RouteContext,
+        posts: u8,
+        repairs: u8,
+        delays_ms: Vec<u64>,
+        failure: &ProviderFailure,
+    ) -> Self {
+        Self {
+            outcome: AttemptOutcome::Failed,
+            provider: context.provider,
+            route: context.route,
+            correlation_id: context.correlation_id.clone(),
+            posts,
+            repairs,
+            delays_ms,
+            mapped_status: Some(failure.status),
+            upstream_status: failure.upstream_status,
+            failure_class: Some(failure.failure_class),
+            retryable: Some(failure.retryable),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests;
