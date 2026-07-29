@@ -30,3 +30,11 @@ The prototype is in-memory only. It performs no network, OAuth, proxy, or filesy
 - `c`: cancellation
 - `r`: reset in-memory state
 - `q`: quit
+
+## Verdict
+
+Decision: accepted
+
+The user validated the pure Attempt Controller seam after driving the permanent-failure, retry-exhaustion, one-repair, response-started, rate/quota, authentication/authorization, and cancellation scenarios.
+
+Observation: The controller centralizes policy and state without taking Provider Route I/O away from adapters.
