@@ -2197,6 +2197,9 @@ pub fn serve(cfg: GatewayConfig) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(all(test, feature = "acceptance-build"))]
+mod codex_acceptance;
+
 #[cfg(test)]
 mod tests {
     use std::collections::{HashMap, HashSet};

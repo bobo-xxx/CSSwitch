@@ -20,7 +20,7 @@
 - Retryable target cases permit at most three total POSTs; the Safe Repair case permits exactly one replay and at most two total POSTs.
 - Normalize a final `Retry-After` delta to at most 60 seconds; do not assert elapsed wall-clock time.
 - Once downstream streaming bytes begin, the expected POST count remains one.
-- Keep legacy caller fields `type`, `error.type`, and `error.message`; attempt counts belong to diagnostics, not the caller envelope.
+- Keep legacy caller fields `type`, `error.type`, and `error.message`; attempt counts do not belong to the caller envelope. Ticket 05 owns their future structured diagnostic projection.
 - Contract tests encode the approved target and may fail. Do not weaken an assertion to make the current handler green and do not add artificial failure branches.
 - Harness self-tests must pass before any contract failure is accepted as evidence.
 - Do not resolve the Wayfinder ticket until the user gives a live verdict on the expected-red report.
@@ -31,7 +31,8 @@
 
 - Modify `desktop/gateway/src/server.rs:2199` — declare the test-only acceptance module and make no other change.
 - Create `desktop/gateway/src/server/codex_acceptance.rs` — scripted upstream, handler runner, self-tests, and target contract tests.
-- Create `docs/superpowers/reports/2026-07-29-codex-acceptance-harness-expected-red.md` — reproducible commands, green harness evidence, current contract gaps, and Ticket 05 mapping.
+- Create `docs/evidence/investigations/2026-07-29-codex-acceptance-harness-expected-red.md` — reproducible commands, green harness evidence, current contract gaps, environment identity, and Ticket 05 mapping.
+- Modify `docs/evidence/investigations/README.md` — index the dated audit.
 - Modify `.scratch/provider-failure-contract/issues/03-prototype-codex-acceptance-harness.md` only after the live verdict — record the accepted answer and branch revision.
 - Modify `.scratch/provider-failure-contract/map.md` only after the live verdict — publish the resolved-ticket pointer.
 
@@ -94,6 +95,16 @@ git add desktop/gateway/src/server.rs desktop/gateway/src/server/codex_acceptanc
 git commit -m "test: gate Codex acceptance harness"
 ```
 
+## Final-review scope amendment
+
+The user selected the strict test-only boundary after final review. This amendment governs any earlier sketch below that implies a wider seam:
+
+- Ticket 03 observes the real handler through exact captured POST methods, paths, bodies, ordered responses, and authentic caller/stream output. It does not add a handler-level structured diagnostic collector or deterministic scheduler injection.
+- Ticket 05 owns handler-level structured diagnostics, validated fallback-delay policy, deterministic scheduler injection, consumed-delay evidence, and positive-delay sequencing.
+- The request parser uses explicit 16 KiB header, 256 KiB body, and checked total maxima. It captures only `accept` and `content-type`; non-POST and malformed requests are rejected and separately counted without consuming scripted POST steps.
+- Repair coverage includes unknown typed code, wrong `param`, route-disabled policy, and a used-repair barrier. Network-only exhaustion, absent optional fields, malformed/oversized request IDs, and parsed terminal SSE sanitization are target cases.
+- The dated evidence report belongs under `docs/evidence/investigations/`, not the implementation-planning tree.
+
 ### Task 2: Build the scripted loopback upstream
 
 **Files:**
@@ -101,7 +112,7 @@ git commit -m "test: gate Codex acceptance harness"
 
 **Interfaces:**
 - Consumes: `std::net::TcpListener`, ordered `VecDeque<UpstreamStep>`, and bounded JSON request bodies.
-- Produces: `ScriptedCodexUpstream::start(Vec<UpstreamStep>)`, `endpoint(&str) -> String`, and `finish() -> ScriptResult`.
+- Produces: `ScriptedCodexUpstream::start(Vec<UpstreamStep>)`, `endpoint(&str) -> String`, bounded allowlisted request capture, and `finish() -> ScriptResult` with separate invalid-method/request accounting.
 
 - [ ] **Step 1: Write the failing request-capture self-test**
 
@@ -313,64 +324,18 @@ impl Drop for ScriptedCodexUpstream {
 
 - [ ] **Step 4: Implement bounded request capture**
 
-Add the bounded request parser. It reads through the declared `Content-Length`, lowercases header names, and discards exactly the two secret-bearing headers before capture:
+Add the bounded request parser. It reads through the declared `Content-Length`, lowercases header names, applies the final-review size ceilings, and positively allowlists only safe selected headers:
 
 ```rust
-fn read_request(stream: &mut TcpStream) -> CapturedRequest {
-    stream
-        .set_read_timeout(Some(Duration::from_secs(2)))
-        .expect("set request read timeout");
-    let mut raw = Vec::new();
-    let mut expected = None;
-    let mut buffer = [0_u8; 1024];
-    loop {
-        let read = stream.read(&mut buffer).expect("read scripted request");
-        assert!(read > 0, "scripted request ended before its declared body");
-        raw.extend_from_slice(&buffer[..read]);
-        if expected.is_none() {
-            if let Some(head_end) = raw.windows(4).position(|part| part == b"\r\n\r\n") {
-                let head = String::from_utf8_lossy(&raw[..head_end]);
-                let content_length = head
-                    .lines()
-                    .skip(1)
-                    .find_map(|line| {
-                        let (name, value) = line.split_once(':')?;
-                        name.eq_ignore_ascii_case("content-length")
-                            .then(|| value.trim().parse::<usize>().expect("numeric content length"))
-                    })
-                    .unwrap_or(0);
-                expected = Some(head_end + 4 + content_length);
-            }
-        }
-        if expected.is_some_and(|length| raw.len() >= length) {
-            break;
-        }
-    }
+const MAX_REQUEST_HEADER_BYTES: usize = 16 * 1024;
+const MAX_REQUEST_BODY_BYTES: usize = 256 * 1024;
+const MAX_REQUEST_TOTAL_BYTES: usize = MAX_REQUEST_HEADER_BYTES + MAX_REQUEST_BODY_BYTES;
+const CAPTURED_REQUEST_HEADERS: [&str; 2] = ["accept", "content-type"];
 
-    let head_end = raw
-        .windows(4)
-        .position(|part| part == b"\r\n\r\n")
-        .expect("request header terminator");
-    let head = String::from_utf8_lossy(&raw[..head_end]);
-    let mut lines = head.lines();
-    let mut request_line = lines.next().expect("request line").split_whitespace();
-    let method = request_line.next().expect("request method").to_string();
-    let path = request_line.next().expect("request path").to_string();
-    let headers = lines
-        .filter_map(|line| line.split_once(':'))
-        .map(|(name, value)| (name.to_ascii_lowercase(), value.trim().to_string()))
-        .filter(|(name, _)| name != "authorization" && name != "chatgpt-account-id")
-        .collect();
-    let body = serde_json::from_slice(&raw[head_end + 4..expected.expect("request length")])
-        .expect("synthetic request JSON");
-    CapturedRequest {
-        method,
-        path,
-        headers,
-        body,
-    }
-}
+fn read_request(stream: &mut TcpStream) -> Result<CapturedRequest, RequestReadError>;
 ```
+
+The implementation checks every length addition, stops growth before any ceiling is exceeded, rejects incomplete/invalid requests without consuming a script step, and has self-tests for oversized headers, oversized declared bodies, and non-allowlisted header removal.
 
 - [ ] **Step 5: Implement scripted responses and the manual client**
 
@@ -1212,7 +1177,7 @@ git commit -m "test: specify Codex automatic-choice repair"
 
 **Interfaces:**
 - Consumes: partial-SSE script, raw downstream bytes, direct real-transport errors, and synthetic sentinels.
-- Produces: no-replay streaming anchor and caller/transport diagnostic redaction evidence.
+- Produces: parsed no-replay streaming anchor and caller/supplemental transport-error redaction evidence. This is not a handler-level structured diagnostic collector.
 
 - [ ] **Step 1: Add the partial-stream no-replay test**
 
@@ -1347,7 +1312,7 @@ assert!(!result.requests[0].headers.contains_key("chatgpt-account-id"));
 }
 ```
 
-Finish the scripted server and assert one request, no stored authorization/account headers, and no unexpected POST. This is a supplemental transport diagnostic assertion because the current handler has no structured diagnostic sink; the evidence report records that missing structured sink as Ticket 05 work instead of fabricating one in the harness.
+Finish the scripted server and assert one request, no stored authorization/account headers, and no unexpected POST. This is a supplemental transport-error assertion because the current handler has no structured diagnostic sink; the evidence report records that sink as Ticket 05 work instead of fabricating one in the harness.
 
 - [ ] **Step 4: Run all green harness/anchor filters and commit**
 
@@ -1369,7 +1334,8 @@ Expected: every listed green filter passes.
 ### Task 8: Run the expected-red audit and publish evidence
 
 **Files:**
-- Create: `docs/superpowers/reports/2026-07-29-codex-acceptance-harness-expected-red.md`
+- Create: `docs/evidence/investigations/2026-07-29-codex-acceptance-harness-expected-red.md`
+- Modify: `docs/evidence/investigations/README.md`
 
 **Interfaces:**
 - Consumes: all harness and contract tests from Tasks 1–7.
@@ -1411,7 +1377,7 @@ Create the report with:
 - the three exact commands above and the tested Git revision;
 - a green harness-validity section listing script ordering, request capture, unused/extra step detection, real handler routing, disconnect, partial SSE, and sentinel scanning;
 - a contract table with one row per test, its observed POST count/status/type, target POST count/status/type, and `anchor` or `expected-red` verdict;
-- current-gap mappings: classification/metadata to the Provider Failure module, attempt counts to the Attempt Controller integration, header parsing to Codex transport observation extraction, Safe Repair to the closed route-enabled repair, and structured diagnostics to the future diagnostic projection;
+- current-gap mappings: classification/metadata to the Provider Failure module, attempt counts to the Attempt Controller integration, header parsing to Codex transport observation extraction, Safe Repair to the closed route-enabled repair, and handler diagnostics/scheduler injection explicitly to Ticket 05;
 - an explicit statement that no live credential, external network endpoint, installed profile, OAuth cache, proxy mutation, or production behavior was used;
 - an explicit statement that an overall red contract command is the intended Ticket 03 result and is not claimed as a production pass.
 
@@ -1420,7 +1386,8 @@ Record the observed values emitted by the test run. If any observation differs f
 - [ ] **Step 4: Commit the evidence**
 
 ```bash
-git add -f docs/superpowers/reports/2026-07-29-codex-acceptance-harness-expected-red.md
+git add docs/evidence/investigations/2026-07-29-codex-acceptance-harness-expected-red.md \
+  docs/evidence/investigations/README.md
 git commit -m "docs: record Codex acceptance expected-red"
 git status --short --branch
 ```
