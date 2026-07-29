@@ -12,6 +12,9 @@ use crate::codex_auth::InferenceSecrets;
 use crate::codex_network::CodexHttpClientFactory;
 use crate::config::DEFAULT_CODEX_UPSTREAM_URL;
 use crate::provider_contracts::CodexRuntimeContract;
+use crate::provider_failure::{
+    ErrorCode, ErrorParam, FailureObservation, NetworkKind, ProtocolKind, RateKind, RequestId,
+};
 
 const CODEX_ORIGINATOR: &str = "codex_cli_rs";
 // ChatGPT's Codex edge rejects some product/custom User-Agent values as
@@ -19,6 +22,7 @@ const CODEX_ORIGINATOR: &str = "codex_cli_rs";
 // originator; OAuth and the other provider transports retain CSSwitch's UA.
 const CODEX_INFERENCE_UA: &str = "codex_cli_rs";
 const RESPONSES_LITE_HEADER: &str = "x-openai-internal-codex-responses-lite";
+const FAILURE_BODY_LIMIT: usize = 16 * 1024;
 #[cfg(test)]
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 #[cfg(test)]
@@ -113,12 +117,91 @@ impl Read for CodexUpstream {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone)]
 pub(crate) struct CodexTransportError {
     pub status: u16,
     pub upstream_status: Option<u16>,
     pub detail: &'static str,
     pub cancelled: bool,
+    observation: FailureObservation,
+}
+
+impl CodexTransportError {
+    pub(crate) fn observation(&self) -> FailureObservation {
+        self.observation.clone()
+    }
+}
+
+impl fmt::Debug for CodexTransportError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CodexTransportError")
+            .field("status", &self.status)
+            .field("upstream_status", &self.upstream_status)
+            .field("detail", &self.detail)
+            .field("cancelled", &self.cancelled)
+            .finish()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FailureBodyFacts {
+    rate_kind: Option<RateKind>,
+    error_code: ErrorCode,
+    error_param: ErrorParam,
+}
+
+fn reduce_failure_body(body: &[u8]) -> FailureBodyFacts {
+    let bounded = &body[..body.len().min(FAILURE_BODY_LIMIT)];
+    let parsed: serde_json::Value = match serde_json::from_slice(bounded) {
+        Ok(value) => value,
+        Err(_) => {
+            return FailureBodyFacts {
+                rate_kind: None,
+                error_code: ErrorCode::Absent,
+                error_param: ErrorParam::Absent,
+            };
+        }
+    };
+    let error = &parsed["error"];
+    let error_type = error["type"].as_str();
+    let code = error["code"].as_str();
+    let param = error["param"].as_str();
+    let quota = error_type == Some("insufficient_quota") || code == Some("insufficient_quota");
+    let rate = error_type == Some("rate_limit_error") || code == Some("rate_limit_exceeded");
+    FailureBodyFacts {
+        rate_kind: if quota {
+            Some(RateKind::Quota)
+        } else if rate {
+            Some(RateKind::RateLimit)
+        } else {
+            None
+        },
+        error_code: match code {
+            Some("unsupported_value") => ErrorCode::UnsupportedValue,
+            Some("insufficient_quota") => ErrorCode::InsufficientQuota,
+            Some("rate_limit_exceeded") => ErrorCode::RateLimitExceeded,
+            _ if error_type == Some("insufficient_quota") => ErrorCode::InsufficientQuota,
+            Some(_) => ErrorCode::Other,
+            None => ErrorCode::Absent,
+        },
+        error_param: match param {
+            Some("tool_choice") => ErrorParam::ToolChoice,
+            Some(_) => ErrorParam::Other,
+            None => ErrorParam::Absent,
+        },
+    }
+}
+
+fn parse_retry_after(value: Option<&str>) -> Option<u64> {
+    let value = value?;
+    (!value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()))
+        .then(|| value.parse().ok())
+        .flatten()
+}
+
+fn parse_request_id(value: Option<&str>) -> Option<RequestId> {
+    RequestId::new(value?)
 }
 
 fn challenge_detected(response: &Response) -> bool {
@@ -211,6 +294,7 @@ impl CodexTransport {
                 upstream_status: None,
                 detail: "Codex network route initialization failed",
                 cancelled: false,
+                observation: FailureObservation::Network(NetworkKind::Connect),
             })?;
         Self::new_with_factory(
             DEFAULT_CODEX_UPSTREAM_URL.to_string(),
@@ -246,6 +330,7 @@ impl CodexTransport {
                 upstream_status: None,
                 detail: "Codex network route initialization failed",
                 cancelled: false,
+                observation: FailureObservation::Network(NetworkKind::Connect),
             })?
             .redirect(reqwest::redirect::Policy::none())
             .retry(reqwest::retry::never())
@@ -257,6 +342,7 @@ impl CodexTransport {
                 upstream_status: None,
                 detail: "Codex transport initialization failed",
                 cancelled: false,
+                observation: FailureObservation::Network(NetworkKind::Connect),
             })?;
         Ok(Self {
             client,
@@ -266,8 +352,8 @@ impl CodexTransport {
         })
     }
 
-    /// Sends exactly one inference POST. Callers must never retry this method
-    /// for the same Anthropic request, including on 401 or an empty 200.
+    /// Sends exactly one inference POST. Retry and repair policy belongs to the
+    /// handler-owned Attempt Controller; this method never replays internally.
     pub(crate) fn open_responses(
         &self,
         secrets: &InferenceSecrets,
@@ -282,6 +368,14 @@ impl CodexTransport {
                 upstream_status: None,
                 detail: "Codex authorization is invalid",
                 cancelled: false,
+                observation: FailureObservation::Http {
+                    status: 401,
+                    rate_kind: None,
+                    retry_after_seconds: None,
+                    request_id: None,
+                    error_code: ErrorCode::Absent,
+                    error_param: ErrorParam::Absent,
+                },
             })?;
         authorization_header.set_sensitive(true);
         let mut account_header =
@@ -290,6 +384,14 @@ impl CodexTransport {
                 upstream_status: None,
                 detail: "Codex account authorization is invalid",
                 cancelled: false,
+                observation: FailureObservation::Http {
+                    status: 401,
+                    rate_kind: None,
+                    retry_after_seconds: None,
+                    request_id: None,
+                    error_code: ErrorCode::Absent,
+                    error_param: ErrorParam::Absent,
+                },
             })?;
         account_header.set_sensitive(true);
         let mut request = self
@@ -314,6 +416,7 @@ impl CodexTransport {
                 upstream_status: None,
                 detail: "Codex transport runtime failed",
                 cancelled: false,
+                observation: FailureObservation::Network(NetworkKind::Connect),
             })?;
         let mut response = runtime.block_on(async {
             tokio::select! {
@@ -322,6 +425,7 @@ impl CodexTransport {
                     upstream_status: None,
                     detail: "Codex request was cancelled",
                     cancelled: true,
+                    observation: FailureObservation::Cancelled,
                 }),
                 result = tokio::time::timeout(self.request_timeout, request.send()) => match result {
                     Ok(result) => result.map_err(|_| CodexTransportError {
@@ -329,27 +433,95 @@ impl CodexTransport {
                         upstream_status: None,
                         detail: "Codex upstream request failed",
                         cancelled: false,
+                        observation: FailureObservation::Network(NetworkKind::Connect),
                     }),
                     Err(_) => Err(CodexTransportError {
                         status: 504,
                         upstream_status: None,
                         detail: "Codex upstream response timed out",
                         cancelled: false,
+                        observation: FailureObservation::Network(NetworkKind::Timeout),
                     }),
                 },
             }
         })?;
         let status = response.status().as_u16();
+        let retry_after = response
+            .headers()
+            .get("retry-after")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| parse_retry_after(Some(value)));
+        let request_id = response
+            .headers()
+            .get("x-request-id")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| parse_request_id(Some(value)));
         if !response.status().is_success() {
+            enum BodyRead {
+                Body(Vec<u8>),
+                Cancelled,
+                Unavailable,
+            }
+            let cancellation_for_body = cancellation.clone();
+            let body_read = runtime.block_on(async {
+                match tokio::time::timeout(self.request_timeout, async {
+                    let mut bounded = Vec::with_capacity(FAILURE_BODY_LIMIT);
+                    while bounded.len() < FAILURE_BODY_LIMIT {
+                        let next = tokio::select! {
+                            _ = wait_for_cancel(cancellation_for_body.clone()) => {
+                                return BodyRead::Cancelled;
+                            }
+                            next = response.chunk() => match next {
+                                Ok(next) => next,
+                                Err(_) => return BodyRead::Unavailable,
+                            },
+                        };
+                        let Some(chunk) = next else {
+                            break;
+                        };
+                        let remaining = FAILURE_BODY_LIMIT - bounded.len();
+                        bounded.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+                    }
+                    BodyRead::Body(bounded)
+                })
+                .await
+                {
+                    Ok(result) => result,
+                    Err(_) => BodyRead::Unavailable,
+                }
+            });
+            let body = match body_read {
+                BodyRead::Body(body) => body,
+                BodyRead::Unavailable => Vec::new(),
+                BodyRead::Cancelled => {
+                    return Err(CodexTransportError {
+                        status: 499,
+                        upstream_status: Some(status),
+                        detail: "Codex request was cancelled",
+                        cancelled: true,
+                        observation: FailureObservation::Cancelled,
+                    });
+                }
+            };
+            let facts = reduce_failure_body(&body);
+            let observation = FailureObservation::Http {
+                status,
+                rate_kind: facts.rate_kind,
+                retry_after_seconds: retry_after,
+                request_id,
+                error_code: facts.error_code,
+                error_param: facts.error_param,
+            };
             return Err(CodexTransportError {
-                status: if matches!(status, 401 | 403 | 429) {
-                    status
-                } else {
-                    502
+                status: match status {
+                    401 | 403 | 429 => status,
+                    408 => 504,
+                    _ => 502,
                 },
                 upstream_status: Some(status),
                 detail: "Codex upstream rejected the request",
                 cancelled: false,
+                observation,
             });
         }
         let mut pending = Vec::new();
@@ -362,6 +534,7 @@ impl CodexTransport {
                     upstream_status: Some(status),
                     detail: unexpected_response_detail(&response),
                     cancelled: false,
+                    observation: FailureObservation::Protocol(ProtocolKind::InvalidResponse),
                 });
             }
 
@@ -382,6 +555,7 @@ impl CodexTransport {
                                     upstream_status: Some(status),
                                     detail: "Codex request was cancelled",
                                     cancelled: true,
+                                    observation: FailureObservation::Cancelled,
                                 });
                             }
                             result = response.chunk() => result.map_err(|_| CodexTransportError {
@@ -389,6 +563,7 @@ impl CodexTransport {
                                 upstream_status: Some(status),
                                 detail: "Codex upstream read failed",
                                 cancelled: false,
+                                observation: FailureObservation::Network(NetworkKind::Read),
                             })?,
                         };
                         let Some(chunk) = next else {
@@ -397,6 +572,9 @@ impl CodexTransport {
                                 upstream_status: Some(status),
                                 detail: "Codex upstream returned an empty response",
                                 cancelled: false,
+                                observation: FailureObservation::Protocol(
+                                    ProtocolKind::InvalidResponse,
+                                ),
                             });
                         };
                         consumed.extend_from_slice(&chunk);
@@ -411,6 +589,9 @@ impl CodexTransport {
                                     detail:
                                         "Codex upstream returned HTML instead of an event stream",
                                     cancelled: false,
+                                    observation: FailureObservation::Protocol(
+                                        ProtocolKind::InvalidResponse,
+                                    ),
                                 });
                             }
                             ResponsePrefixKind::Json => {
@@ -420,6 +601,9 @@ impl CodexTransport {
                                     detail:
                                         "Codex upstream returned JSON instead of an event stream",
                                     cancelled: false,
+                                    observation: FailureObservation::Protocol(
+                                        ProtocolKind::InvalidResponse,
+                                    ),
                                 });
                             }
                             ResponsePrefixKind::Other => {
@@ -428,6 +612,9 @@ impl CodexTransport {
                                     upstream_status: Some(status),
                                     detail: "Codex upstream returned an unsupported response body",
                                     cancelled: false,
+                                    observation: FailureObservation::Protocol(
+                                        ProtocolKind::InvalidResponse,
+                                    ),
                                 });
                             }
                             ResponsePrefixKind::NeedMore if prefix.len() < 512 => {}
@@ -437,6 +624,9 @@ impl CodexTransport {
                                     upstream_status: Some(status),
                                     detail: "Codex upstream returned an unsupported response body",
                                     cancelled: false,
+                                    observation: FailureObservation::Protocol(
+                                        ProtocolKind::InvalidResponse,
+                                    ),
                                 });
                             }
                         }
@@ -448,6 +638,7 @@ impl CodexTransport {
                     upstream_status: Some(status),
                     detail: "Codex upstream response body timed out",
                     cancelled: false,
+                    observation: FailureObservation::Network(NetworkKind::Timeout),
                 })?
             })?;
             pending = sniffed;
@@ -478,8 +669,12 @@ mod tests {
     use std::thread;
     use std::time::{Duration, Instant};
 
-    use super::{CodexCancellation, CodexTransport};
+    use super::{
+        parse_request_id, parse_retry_after, reduce_failure_body, CodexCancellation,
+        CodexTransport, FAILURE_BODY_LIMIT,
+    };
     use crate::codex_auth::InferenceSecrets;
+    use crate::provider_failure::{ErrorCode, ErrorParam, FailureObservation, RateKind};
 
     fn bind_loopback() -> TcpListener {
         loop {
@@ -750,5 +945,102 @@ mod tests {
         release_tx.send(()).unwrap();
         canceller.join().unwrap();
         server.join().unwrap();
+    }
+
+    #[test]
+    fn failed_response_extracts_only_allowlisted_facts() {
+        let body = r#"{"error":{"type":"rate_limit_error","code":"rate_limit_exceeded","param":"other","message":"BODY_SECRET"}}"#;
+        let response = format!(
+            "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 90\r\nx-request-id: Req_01.a:b-c\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .into_bytes();
+        let (endpoint, request_rx, handle) = mock_server(response);
+        let transport = CodexTransport::for_test(endpoint).unwrap();
+        let error = transport
+            .open_responses(
+                &secrets(),
+                b"{}".to_vec(),
+                false,
+                CodexCancellation::default(),
+            )
+            .err()
+            .expect("synthetic 429 must fail");
+        assert_eq!(
+            error.observation(),
+            FailureObservation::Http {
+                status: 429,
+                rate_kind: Some(RateKind::RateLimit),
+                retry_after_seconds: Some(90),
+                request_id: crate::provider_failure::RequestId::new("Req_01.a:b-c"),
+                error_code: ErrorCode::RateLimitExceeded,
+                error_param: ErrorParam::Other,
+            }
+        );
+        let diagnostic = format!("{error:?} {error}");
+        assert!(!diagnostic.contains("BODY_SECRET"));
+        assert!(!diagnostic.contains("Req_01.a:b-c"));
+        assert!(request_rx.recv().unwrap().starts_with(b"POST "));
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn quota_wins_when_type_or_code_proves_insufficient_quota() {
+        for body in [
+            r#"{"error":{"type":"insufficient_quota","code":"other"}}"#,
+            r#"{"error":{"type":"other","code":"insufficient_quota"}}"#,
+        ] {
+            let facts = reduce_failure_body(body.as_bytes());
+            assert_eq!(facts.rate_kind, Some(RateKind::Quota));
+            assert_eq!(facts.error_code, ErrorCode::InsufficientQuota);
+        }
+    }
+
+    #[test]
+    fn repair_signal_requires_exact_code_and_parameter() {
+        let exact =
+            reduce_failure_body(br#"{"error":{"code":"unsupported_value","param":"tool_choice"}}"#);
+        assert_eq!(exact.error_code, ErrorCode::UnsupportedValue);
+        assert_eq!(exact.error_param, ErrorParam::ToolChoice);
+
+        for body in [
+            br#"{"error":{"message":"unsupported_value tool_choice"}}"#.as_slice(),
+            br#"{"error":{"code":"unsupported_value","param":"tools"}}"#.as_slice(),
+            br#"{"error":{"code":"other","param":"tool_choice"}}"#.as_slice(),
+        ] {
+            let facts = reduce_failure_body(body);
+            assert!(
+                facts.error_code != ErrorCode::UnsupportedValue
+                    || facts.error_param != ErrorParam::ToolChoice
+            );
+        }
+    }
+
+    #[test]
+    fn retry_after_and_request_id_parsers_are_strict() {
+        assert_eq!(parse_retry_after(Some("0")), Some(0));
+        assert_eq!(parse_retry_after(Some("60")), Some(60));
+        assert_eq!(parse_retry_after(Some(" 7 ")), None);
+        assert_eq!(parse_retry_after(Some("1.5")), None);
+        assert_eq!(
+            parse_retry_after(Some("Wed, 29 Jul 2026 00:00:00 GMT")),
+            None
+        );
+        assert_eq!(parse_retry_after(None), None);
+        assert_eq!(
+            parse_request_id(Some("req:01-A_b.c")).unwrap().as_str(),
+            "req:01-A_b.c"
+        );
+        assert!(parse_request_id(Some("request id")).is_none());
+        assert!(parse_request_id(Some(&"r".repeat(257))).is_none());
+    }
+
+    #[test]
+    fn failure_body_reduction_never_reads_semantics_beyond_16_kib() {
+        let mut body = vec![b' '; FAILURE_BODY_LIMIT];
+        body.extend_from_slice(br#"{"error":{"code":"unsupported_value","param":"tool_choice"}}"#);
+        let facts = reduce_failure_body(&body);
+        assert_eq!(facts.error_code, ErrorCode::Absent);
+        assert_eq!(facts.error_param, ErrorParam::Absent);
     }
 }
