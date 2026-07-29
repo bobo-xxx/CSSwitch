@@ -1,4 +1,3 @@
-use std::borrow::Cow;
 use std::fmt;
 use std::io::Read;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -7,7 +6,8 @@ use std::time::Duration;
 
 use reqwest::header::{HeaderValue, ACCEPT, AUTHORIZATION, CONTENT_TYPE, USER_AGENT};
 use reqwest::{Client, Response};
-use serde::Deserialize;
+use serde::de::{self, Visitor};
+use serde::{Deserialize, Deserializer};
 use zeroize::Zeroizing;
 
 use crate::codex_auth::InferenceSecrets;
@@ -153,29 +153,100 @@ struct FailureBodyFacts {
     error_param: ErrorParam,
 }
 
-#[derive(Deserialize)]
-struct FailureBodyDocument<'a> {
-    #[serde(borrow, default)]
-    error: Option<FailureBodyError<'a>>,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FailureBodyToken {
+    InsufficientQuota,
+    RateLimitError,
+    RateLimitExceeded,
+    UnsupportedValue,
+    ToolChoice,
+    Other,
+}
+
+impl FailureBodyToken {
+    fn from_str(value: &str) -> Self {
+        match value {
+            "insufficient_quota" => Self::InsufficientQuota,
+            "rate_limit_error" => Self::RateLimitError,
+            "rate_limit_exceeded" => Self::RateLimitExceeded,
+            "unsupported_value" => Self::UnsupportedValue,
+            "tool_choice" => Self::ToolChoice,
+            _ => Self::Other,
+        }
+    }
+}
+
+struct FailureBodyTokenVisitor;
+
+impl Visitor<'_> for FailureBodyTokenVisitor {
+    type Value = FailureBodyToken;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a provider failure token")
+    }
+
+    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        Ok(FailureBodyToken::from_str(value))
+    }
+
+    fn visit_borrowed_str<E>(self, value: &'_ str) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        self.visit_str(value)
+    }
+}
+
+impl<'de> Deserialize<'de> for FailureBodyToken {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_str(FailureBodyTokenVisitor)
+    }
 }
 
 #[derive(Deserialize)]
-struct FailureBodyError<'a> {
-    #[serde(rename = "type", borrow, default)]
-    kind: Option<Cow<'a, str>>,
-    #[serde(borrow, default)]
-    code: Option<Cow<'a, str>>,
-    #[serde(borrow, default)]
-    param: Option<Cow<'a, str>>,
+struct FailureBodyDocument {
+    #[serde(default)]
+    error: Option<FailureBodyError>,
+}
+
+#[derive(Deserialize)]
+struct FailureBodyError {
+    #[serde(rename = "type", default)]
+    kind: Option<FailureBodyToken>,
+    #[serde(default)]
+    code: Option<FailureBodyToken>,
+    #[serde(default)]
+    param: Option<FailureBodyToken>,
 }
 
 const FAILURE_PARSED_STORAGE: usize =
-    std::mem::size_of::<FailureBodyDocument<'static>>() + std::mem::size_of::<FailureBodyFacts>();
-// In the worst case all three allowlisted strings contain JSON escapes and
-// serde_json must own their decoded bytes. Their combined size cannot exceed
-// the input size, so reserving a second input-sized budget keeps caller-owned
-// input plus parsed storage within FAILURE_BODY_LIMIT.
-const FAILURE_BODY_INPUT_LIMIT: usize = (FAILURE_BODY_LIMIT - FAILURE_PARSED_STORAGE) / 2;
+    std::mem::size_of::<FailureBodyDocument>() + std::mem::size_of::<FailureBodyFacts>();
+// One region retains the admitted input. Two more input-sized regions cover
+// serde_json's transient escaped-string scratch and conservative amortized
+// capacity slack. Projection visits strings directly into closed enums, so no
+// decoded string survives the visitor. The parser is never invoked when this
+// caller-controlled capacity calculation would exceed FAILURE_BODY_LIMIT.
+const FAILURE_BODY_VARIABLE_REGIONS: usize = 3;
+const FAILURE_BODY_INPUT_LIMIT: usize =
+    (FAILURE_BODY_LIMIT - FAILURE_PARSED_STORAGE) / FAILURE_BODY_VARIABLE_REGIONS;
+
+const EMPTY_FAILURE_BODY_FACTS: FailureBodyFacts = FailureBodyFacts {
+    rate_kind: None,
+    error_code: ErrorCode::Absent,
+    error_param: ErrorParam::Absent,
+};
+
+fn failure_body_memory_budget(input_capacity: usize) -> Option<usize> {
+    input_capacity
+        .checked_mul(FAILURE_BODY_VARIABLE_REGIONS)?
+        .checked_add(FAILURE_PARSED_STORAGE)
+}
 
 struct FailureBodyCollector {
     body: Vec<u8>,
@@ -185,8 +256,12 @@ struct FailureBodyCollector {
 impl FailureBodyCollector {
     fn new(declared_length: Option<u64>) -> Option<Self> {
         let declared_length = usize::try_from(declared_length?).ok()?;
-        (declared_length <= FAILURE_BODY_INPUT_LIMIT).then(|| Self {
-            body: Vec::with_capacity(declared_length),
+        if declared_length > FAILURE_BODY_INPUT_LIMIT {
+            return None;
+        }
+        let body = Vec::with_capacity(declared_length);
+        (failure_body_memory_budget(body.capacity())? <= FAILURE_BODY_LIMIT).then_some(Self {
+            body,
             declared_length,
         })
     }
@@ -209,23 +284,21 @@ impl FailureBodyCollector {
 }
 
 fn reduce_failure_body(body: &[u8]) -> FailureBodyFacts {
-    let bounded = &body[..body.len().min(FAILURE_BODY_INPUT_LIMIT)];
-    let parsed: FailureBodyDocument<'_> = match serde_json::from_slice(bounded) {
+    if body.len() > FAILURE_BODY_INPUT_LIMIT {
+        return EMPTY_FAILURE_BODY_FACTS;
+    }
+    let parsed: FailureBodyDocument = match serde_json::from_slice(body) {
         Ok(value) => value,
-        Err(_) => {
-            return FailureBodyFacts {
-                rate_kind: None,
-                error_code: ErrorCode::Absent,
-                error_param: ErrorParam::Absent,
-            };
-        }
+        Err(_) => return EMPTY_FAILURE_BODY_FACTS,
     };
     let error = parsed.error;
-    let error_type = error.as_ref().and_then(|value| value.kind.as_deref());
-    let code = error.as_ref().and_then(|value| value.code.as_deref());
-    let param = error.as_ref().and_then(|value| value.param.as_deref());
-    let quota = error_type == Some("insufficient_quota") || code == Some("insufficient_quota");
-    let rate = error_type == Some("rate_limit_error") || code == Some("rate_limit_exceeded");
+    let error_type = error.as_ref().and_then(|value| value.kind);
+    let code = error.as_ref().and_then(|value| value.code);
+    let param = error.as_ref().and_then(|value| value.param);
+    let quota = error_type == Some(FailureBodyToken::InsufficientQuota)
+        || code == Some(FailureBodyToken::InsufficientQuota);
+    let rate = error_type == Some(FailureBodyToken::RateLimitError)
+        || code == Some(FailureBodyToken::RateLimitExceeded);
     FailureBodyFacts {
         rate_kind: if quota {
             Some(RateKind::Quota)
@@ -235,15 +308,17 @@ fn reduce_failure_body(body: &[u8]) -> FailureBodyFacts {
             None
         },
         error_code: match code {
-            Some("unsupported_value") => ErrorCode::UnsupportedValue,
-            Some("insufficient_quota") => ErrorCode::InsufficientQuota,
-            Some("rate_limit_exceeded") => ErrorCode::RateLimitExceeded,
-            _ if error_type == Some("insufficient_quota") => ErrorCode::InsufficientQuota,
+            Some(FailureBodyToken::UnsupportedValue) => ErrorCode::UnsupportedValue,
+            Some(FailureBodyToken::InsufficientQuota) => ErrorCode::InsufficientQuota,
+            Some(FailureBodyToken::RateLimitExceeded) => ErrorCode::RateLimitExceeded,
+            _ if error_type == Some(FailureBodyToken::InsufficientQuota) => {
+                ErrorCode::InsufficientQuota
+            }
             Some(_) => ErrorCode::Other,
             None => ErrorCode::Absent,
         },
         error_param: match param {
-            Some("tool_choice") => ErrorParam::ToolChoice,
+            Some(FailureBodyToken::ToolChoice) => ErrorParam::ToolChoice,
             Some(_) => ErrorParam::Other,
             None => ErrorParam::Absent,
         },
@@ -744,9 +819,9 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{
-        parse_request_id, parse_retry_after, reduce_failure_body, CodexCancellation,
-        CodexTransport, FailureBodyCollector, FAILURE_BODY_INPUT_LIMIT, FAILURE_BODY_LIMIT,
-        FAILURE_PARSED_STORAGE,
+        failure_body_memory_budget, parse_request_id, parse_retry_after, reduce_failure_body,
+        CodexCancellation, CodexTransport, FailureBodyCollector, FAILURE_BODY_INPUT_LIMIT,
+        FAILURE_BODY_LIMIT, FAILURE_BODY_VARIABLE_REGIONS,
     };
     use crate::codex_auth::InferenceSecrets;
     use crate::provider_failure::{ErrorCode, ErrorParam, FailureObservation, RateKind};
@@ -1125,6 +1200,43 @@ mod tests {
     }
 
     #[test]
+    fn failure_body_budget_reserves_three_input_sized_regions() {
+        assert_eq!(FAILURE_BODY_VARIABLE_REGIONS, 3);
+        let admitted = failure_body_memory_budget(FAILURE_BODY_INPUT_LIMIT).unwrap();
+        let first_rejected = failure_body_memory_budget(FAILURE_BODY_INPUT_LIMIT + 1).unwrap();
+        assert!(admitted <= FAILURE_BODY_LIMIT);
+        assert!(first_rejected > FAILURE_BODY_LIMIT);
+    }
+
+    #[test]
+    fn near_limit_late_escape_reduces_directly_to_closed_facts() {
+        let prefix = br#"{"error":{"code":""#;
+        let suffix = br#"\u0061","param":"tool_choice"}}"#;
+        let fill = FAILURE_BODY_INPUT_LIMIT - prefix.len() - suffix.len();
+        let mut body = Vec::with_capacity(FAILURE_BODY_INPUT_LIMIT);
+        body.extend_from_slice(prefix);
+        body.resize(body.len() + fill, b'x');
+        body.extend_from_slice(suffix);
+        assert_eq!(body.len(), FAILURE_BODY_INPUT_LIMIT);
+
+        let facts = reduce_failure_body(&body);
+
+        assert_eq!(facts.error_code, ErrorCode::Other);
+        assert_eq!(facts.error_param, ErrorParam::ToolChoice);
+    }
+
+    #[test]
+    fn over_budget_failure_body_is_not_parsed_or_projected() {
+        let mut body = br#"{"error":{"code":"unsupported_value","param":"tool_choice"}}"#.to_vec();
+        body.resize(FAILURE_BODY_INPUT_LIMIT + 1, b' ');
+
+        let facts = reduce_failure_body(&body);
+
+        assert_eq!(facts.error_code, ErrorCode::Absent);
+        assert_eq!(facts.error_param, ErrorParam::Absent);
+    }
+
+    #[test]
     fn oversized_failure_frame_is_not_retained_or_parsed_by_the_caller() {
         let mut body = br#"{"error":{"code":"unsupported_value","param":"tool_choice"}}"#.to_vec();
         body.resize(FAILURE_BODY_LIMIT + 1, b' ');
@@ -1132,7 +1244,9 @@ mod tests {
             .expect("the maximum bounded input must be admitted");
         assert!(!collector.retain(&body));
         assert_eq!(collector.body.len(), 0);
-        assert!(collector.body.capacity() + FAILURE_PARSED_STORAGE <= FAILURE_BODY_LIMIT);
+        assert!(
+            failure_body_memory_budget(collector.body.capacity()).unwrap() <= FAILURE_BODY_LIMIT
+        );
         assert!(FailureBodyCollector::new(Some(body.len() as u64)).is_none());
 
         let response = format!(
