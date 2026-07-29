@@ -14,6 +14,9 @@ use crate::codex_transport::CodexTransport;
 
 const ACCESS_SENTINEL: &str = "ACCEPTANCE_ACCESS_TOKEN_SENTINEL";
 const ACCOUNT_SENTINEL: &str = "ACCEPTANCE_ACCOUNT_SENTINEL";
+const BODY_SENTINEL: &str = "UPSTREAM_BODY_SECRET_SENTINEL";
+const COOKIE_SENTINEL: &str = "UPSTREAM_COOKIE_SECRET_SENTINEL";
+const URL_SENTINEL: &str = "PRIVATE_UPSTREAM_PATH_SENTINEL";
 
 struct AcceptanceCase {
     request: Value,
@@ -479,6 +482,110 @@ fn complete_sse() -> Vec<u8> {
     .map(|event| format!("data: {event}\n\n"))
     .collect::<String>()
     .into_bytes()
+}
+
+fn partial_sse() -> Vec<u8> {
+    [
+        serde_json::json!({"type":"response.created","response":{"id":"resp-partial"}}),
+        serde_json::json!({"type":"response.output_text.delta","item_id":"msg","delta":"partial-visible"}),
+    ]
+    .into_iter()
+    .map(|event| format!("data: {event}\n\n"))
+    .collect::<String>()
+    .into_bytes()
+}
+
+fn redaction_step() -> UpstreamStep {
+    UpstreamStep::json_with_headers(
+        500,
+        "Internal Server Error",
+        serde_json::json!({"error":{"message":BODY_SENTINEL}}),
+        vec![
+            ("set-cookie", COOKIE_SENTINEL),
+            ("x-request-id", "req-safe-500"),
+        ],
+    )
+}
+
+#[test]
+fn contract_partial_stream_failure_never_replays() {
+    let result = run_case(AcceptanceCase {
+        request: anthropic_request(true),
+        is_stream: true,
+        use_responses_lite: false,
+        endpoint_path: "/responses",
+        steps: vec![UpstreamStep::PartialSseThenDrop(partial_sse())],
+    });
+    assert_eq!(result.status(), 200);
+    assert_eq!(result.script.requests.len(), 1);
+    assert_eq!(result.script.remaining_steps, 0);
+    assert_eq!(result.text().matches("partial-visible").count(), 1);
+    assert_eq!(result.text().matches("event: error").count(), 1);
+}
+
+#[test]
+fn contract_failure_schema_and_caller_redaction() {
+    let result = run_case(AcceptanceCase {
+        request: anthropic_request(false),
+        is_stream: false,
+        use_responses_lite: false,
+        endpoint_path: "/PRIVATE_UPSTREAM_PATH_SENTINEL/responses",
+        steps: vec![redaction_step()],
+    });
+    let raw = result.text();
+    for forbidden in [
+        BODY_SENTINEL,
+        COOKIE_SENTINEL,
+        URL_SENTINEL,
+        ACCESS_SENTINEL,
+        ACCOUNT_SENTINEL,
+    ] {
+        assert!(!raw.contains(forbidden));
+    }
+    assert_failure_envelope(
+        &result,
+        502,
+        "api_error",
+        "responses",
+        "transient",
+        Some(500),
+        true,
+    );
+    assert_eq!(result.json()["error"]["request_id"], "req-safe-500");
+}
+
+#[test]
+fn contract_transport_diagnostic_projection_is_redacted() {
+    let upstream = ScriptedCodexUpstream::start(vec![redaction_step()]);
+    let transport =
+        CodexTransport::for_test(upstream.endpoint("/PRIVATE_UPSTREAM_PATH_SENTINEL/responses"))
+            .expect("construct diagnostic transport");
+    let error = match transport.open_responses(
+        &InferenceSecrets::for_test(ACCESS_SENTINEL, ACCOUNT_SENTINEL),
+        serde_json::to_vec(&serde_json::json!({"prompt": BODY_SENTINEL})).unwrap(),
+        false,
+        crate::codex_transport::CodexCancellation::default(),
+    ) {
+        Ok(_) => panic!("synthetic 500 must return a transport error"),
+        Err(error) => error,
+    };
+    let diagnostic = format!("{error:?} {error}");
+    for forbidden in [
+        BODY_SENTINEL,
+        COOKIE_SENTINEL,
+        URL_SENTINEL,
+        ACCESS_SENTINEL,
+        ACCOUNT_SENTINEL,
+    ] {
+        assert!(!diagnostic.contains(forbidden));
+    }
+    let result = upstream.finish();
+    assert_eq!(result.requests.len(), 1);
+    assert_eq!(result.unexpected_posts, 0);
+    assert!(!result.requests[0].headers.contains_key("authorization"));
+    assert!(!result.requests[0]
+        .headers
+        .contains_key("chatgpt-account-id"));
 }
 
 fn rate_limit_step(retry_after: &str, request_id: Option<&str>) -> UpstreamStep {
