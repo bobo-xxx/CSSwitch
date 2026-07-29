@@ -1,7 +1,7 @@
 # Implement the Codex-first contract slice
 
 Type: task
-Status: open
+Status: claimed
 Blocked by: 02, 03
 
 ## Question
