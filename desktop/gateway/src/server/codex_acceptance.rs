@@ -348,9 +348,23 @@ struct ScriptedCodexUpstream {
     thread: Option<thread::JoinHandle<()>>,
 }
 
+fn bind_loopback() -> TcpListener {
+    loop {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback fixture");
+        if listener
+            .local_addr()
+            .expect("read loopback fixture address")
+            .port()
+            != 8765
+        {
+            return listener;
+        }
+    }
+}
+
 impl ScriptedCodexUpstream {
     fn start(steps: Vec<UpstreamStep>) -> Self {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback upstream");
+        let listener = bind_loopback();
         listener
             .set_nonblocking(true)
             .expect("make loopback upstream nonblocking");
@@ -753,7 +767,7 @@ fn assert_retry_bodies_identical(result: &AcceptanceResult) {
 }
 
 fn capture_downstream(handler: impl FnOnce(&mut TcpStream)) -> Vec<u8> {
-    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind downstream capture");
+    let listener = bind_loopback();
     let address = listener.local_addr().expect("read downstream address");
     let reader = thread::spawn(move || {
         let mut stream = TcpStream::connect(address).expect("connect downstream reader");
@@ -1566,6 +1580,20 @@ fn contract_401_is_authentication_and_not_retried() {
 #[test]
 fn contract_403_is_authorization_and_not_retried() {
     assert_auth_failure(403, "Forbidden", "permission_error", "authorization");
+}
+
+#[test]
+fn bind_loopback_avoids_reserved_science_port() {
+    let listener = bind_loopback();
+
+    assert_ne!(
+        listener
+            .local_addr()
+            .expect("read guarded loopback address")
+            .port(),
+        8765,
+        "acceptance fixtures must not claim the reserved Science port"
+    );
 }
 
 #[test]
