@@ -8,7 +8,7 @@ Ticket 05 implements the Provider Failure Contract through the real Codex handle
 
 ## Revision and environment
 
-The structurally bounded parser and terminal-delivery implementation was tested from a clean worktree at revision `0ece2287f640868a1e32dfde29340a6ae9ae76ae` before this evidence-only commit. The literal revision and environment commands and outputs were:
+The structurally bounded parser, terminal-delivery implementation, and reserved-port-safe acceptance fixtures were tested from a clean worktree at revision `9591a869f7268b5ff6baee00eb1365b36c54a618` before this evidence-only commit. The literal revision and environment commands and outputs were:
 
 ```text
 $ git status --short
@@ -16,7 +16,7 @@ $ git status --short
 exit 0
 
 $ git rev-parse HEAD
-0ece2287f640868a1e32dfde29340a6ae9ae76ae
+9591a869f7268b5ff6baee00eb1365b36c54a618
 exit 0
 
 $ rustc --version
@@ -32,15 +32,15 @@ Linux shengxin02 6.8.0-90-generic #91~22.04.1-Ubuntu SMP PREEMPT_DYNAMIC Thu Nov
 exit 0
 ```
 
-The parser and terminal-delivery remediation was committed before the immutable gate run:
+The acceptance-fixture reserved-port remediation was committed before the immutable gate run:
 
 ```text
-$ git add desktop/gateway/src/codex_transport.rs desktop/gateway/src/provider_failure.rs desktop/gateway/src/server.rs
+$ git add desktop/gateway/src/server/codex_acceptance.rs
 exit 0
 
-$ git commit -m "fix: finalize bounded Codex failure delivery"
-[feature/codex-provider-failure 0ece228] fix: finalize bounded Codex failure delivery
-3 files changed, 802 insertions(+), 217 deletions(-)
+$ git commit -m "test: avoid reserved Science port in Codex fixtures"
+[feature/codex-provider-failure 9591a86] test: avoid reserved Science port in Codex fixtures
+1 file changed, 30 insertions(+), 2 deletions(-)
 exit 0
 ```
 
@@ -84,7 +84,7 @@ exit 0
 
 ```text
 $ cargo test --offline --manifest-path desktop/gateway/Cargo.toml --features acceptance-build 'server::codex_acceptance::harness_' -- --nocapture --test-threads=1
-lib: 8 passed; 0 failed; 0 ignored; 0 measured; 342 filtered out
+lib: 8 passed; 0 failed; 0 ignored; 0 measured; 343 filtered out
 main: 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 codex_auth_cli: 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out
 exit 0
@@ -92,7 +92,15 @@ exit 0
 
 ```text
 $ cargo test --offline --manifest-path desktop/gateway/Cargo.toml --features acceptance-build 'server::codex_acceptance::contract_' -- --nocapture --test-threads=1
-lib: 27 passed; 0 failed; 0 ignored; 0 measured; 323 filtered out
+lib: 27 passed; 0 failed; 0 ignored; 0 measured; 324 filtered out
+main: 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+codex_auth_cli: 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out
+exit 0
+```
+
+```text
+$ cargo test --offline --manifest-path desktop/gateway/Cargo.toml --features acceptance-build bind_loopback_avoids_reserved_science_port -- --nocapture --test-threads=1
+lib: 1 passed; 0 failed; 0 ignored; 0 measured; 350 filtered out
 main: 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 codex_auth_cli: 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out
 exit 0
@@ -108,7 +116,7 @@ exit 0
 
 ```text
 $ cargo test --offline --manifest-path desktop/gateway/Cargo.toml --all-features -- --test-threads=1
-lib: 350 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+lib: 351 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 main: 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 codex_auth_cli: 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 doc tests: 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
@@ -124,11 +132,11 @@ server::codex_acceptance::attempt_wait_cancellation_emits_one_final_diagnostic_w
 
 ```text
 $ cargo clippy --offline --manifest-path desktop/gateway/Cargo.toml --all-targets --all-features -- -D warnings
-Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.14s
+Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.15s
 exit 0; no warnings
 ```
 
-The accepted harness passes 8/8, the accepted Provider Failure Contract passes 27/27, and the non-contract attempt integrations pass 2/2. The pure controller suite passes 12/12, the transport suite passes 18/18, and the terminal-delivery suite passes 5/5.
+The accepted harness passes 8/8, the accepted Provider Failure Contract passes 27/27, the reserved-port fixture regression passes 1/1, and the non-contract attempt integrations pass 2/2. The pure controller suite passes 12/12, the transport suite passes 18/18, and the terminal-delivery suite passes 5/5.
 
 ## Behavioral evidence
 
@@ -142,6 +150,7 @@ The accepted harness passes 8/8, the accepted Provider Failure Contract passes 2
 - Every started attempt sequence emits one final `completed`, `failed`, or `cancelled` diagnostic.
 - Final diagnostic construction is checked and single-use: duplicate finalization and phase-incompatible outcomes return `FinalizationNotAuthorized` rather than overwriting terminal state or constructing a second diagnostic.
 - Final diagnostics are emitted only after the terminal downstream delivery result is known. A failed final non-stream response, provider-failure response, terminal SSE error, stream terminator, or terminal flush produces exactly one `cancelled` diagnostic and cannot also produce `completed` or `failed`.
+- Codex acceptance upstream and downstream loopback fixtures use one guarded binder that rejects the reserved Science port `8765` without changing accepted harness or contract membership.
 
 ## Redaction boundary
 
