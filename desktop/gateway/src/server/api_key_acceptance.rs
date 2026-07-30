@@ -353,12 +353,6 @@ fn read_request(stream: &mut TcpStream) -> Result<CapturedRequest, ()> {
                 let headers = lines
                     .filter_map(|line| line.split_once(':'))
                     .map(|(name, value)| (name.to_ascii_lowercase(), value.trim().to_owned()))
-                    .filter(|(name, _)| {
-                        matches!(
-                            name.as_str(),
-                            "accept" | "content-type" | "anthropic-version"
-                        )
-                    })
                     .collect();
                 return Ok(CapturedRequest {
                     method,
@@ -572,7 +566,14 @@ fn run(route: FixtureRoute, mode: AttemptMode, steps: Vec<UpstreamStep>) -> Acce
     }
 }
 
-fn failure_body(status: u16, error_code: ErrorCode) -> Value {
+fn request_id_sentinel(route: FixtureRoute) -> &'static str {
+    match route {
+        FixtureRoute::RelayAnthropic | FixtureRoute::RelayKimi => "Req-secret-01",
+        FixtureRoute::DeepseekAnthropic => "Req-secret-02",
+    }
+}
+
+fn failure_body(route: FixtureRoute, status: u16, error_code: ErrorCode) -> Value {
     let code = match error_code {
         ErrorCode::InsufficientQuota => "insufficient_quota",
         ErrorCode::RateLimitError => "rate_limit_error",
@@ -583,7 +584,7 @@ fn failure_body(status: u16, error_code: ErrorCode) -> Value {
     let mut error = json!({
         "type": "api_error",
         "message": SECRET_UPSTREAM_TEXT,
-        "request_id": "Req-secret-01",
+        "request_id": request_id_sentinel(route),
         "host": PRIVATE_HOST_SENTINEL
     });
     if !code.is_empty() {
@@ -592,7 +593,7 @@ fn failure_body(status: u16, error_code: ErrorCode) -> Value {
     json!({"error": error, "status": status})
 }
 
-fn assert_script(result: &AcceptanceResult, expected_posts: usize) {
+fn assert_script(route: FixtureRoute, result: &AcceptanceResult, expected_posts: usize) {
     assert_eq!(result.script.requests.len(), expected_posts);
     assert_eq!(result.script.remaining_steps, 0);
     assert_eq!(result.script.unexpected_posts, 0);
@@ -601,8 +602,26 @@ fn assert_script(result: &AcceptanceResult, expected_posts: usize) {
     for request in &result.script.requests {
         assert_eq!(request.method, "POST");
         assert_eq!(request.path, "/v1/messages");
-        assert!(!request.headers.contains_key("authorization"));
-        assert!(!request.headers.contains_key("x-api-key"));
+        assert_eq!(
+            request.headers.get("x-api-key").map(String::as_str),
+            Some(API_KEY_SENTINEL),
+            "synthetic API key must be sent upstream"
+        );
+        if matches!(
+            route,
+            FixtureRoute::RelayAnthropic | FixtureRoute::RelayKimi
+        ) {
+            assert_eq!(
+                request.headers.get("authorization").map(String::as_str),
+                Some("Bearer fixture-api-key"),
+                "relay dual auth must include synthetic bearer"
+            );
+        } else {
+            assert!(
+                !request.headers.contains_key("authorization"),
+                "DeepSeek x-api-key auth must not add bearer auth"
+            );
+        }
         assert!(!String::from_utf8_lossy(&request.body).contains(API_KEY_SENTINEL));
     }
     if let Some((first, rest)) = result.script.requests.split_first() {
@@ -646,10 +665,10 @@ fn assert_terminal_http(
         vec![UpstreamStep::json(
             status,
             "Synthetic Failure",
-            failure_body(status, error_code),
+            failure_body(route, status, error_code),
         )],
     );
-    assert_script(&result, expected_posts);
+    assert_script(route, &result, expected_posts);
     assert!(result.delays_ms.is_empty());
     assert_failure_response(&result, status);
     assert_one_final_diagnostic(&result, "failed");
@@ -677,13 +696,13 @@ fn assert_retry_then_success(
             UpstreamStep::json_with_headers(
                 first_status,
                 "Too Many Requests",
-                failure_body(first_status, ErrorCode::RateLimitError),
+                failure_body(route, first_status, ErrorCode::RateLimitError),
                 headers,
             ),
             success_step(route, mode),
         ],
     );
-    assert_script(&result, 2);
+    assert_script(route, &result, 2);
     assert_eq!(result.delays_ms, vec![expected_delay_ms]);
     assert_success_body(route, mode, &result);
     assert_one_final_diagnostic(&result, "completed");
@@ -702,21 +721,21 @@ fn assert_exhausted(
             UpstreamStep::json(
                 status,
                 "Unavailable",
-                failure_body(status, ErrorCode::RateLimitError),
+                failure_body(route, status, ErrorCode::RateLimitError),
             ),
             UpstreamStep::json(
                 status,
                 "Unavailable",
-                failure_body(status, ErrorCode::RateLimitError),
+                failure_body(route, status, ErrorCode::RateLimitError),
             ),
             UpstreamStep::json(
                 status,
                 "Unavailable",
-                failure_body(status, ErrorCode::RateLimitError),
+                failure_body(route, status, ErrorCode::RateLimitError),
             ),
         ],
     );
-    assert_script(&result, 3);
+    assert_script(route, &result, 3);
     assert_eq!(result.delays_ms, expected_delays_ms);
     assert_failure_response(&result, 502);
     assert_one_final_diagnostic(&result, "failed");
@@ -732,16 +751,25 @@ fn assert_opened_failure(route: FixtureRoute, mode: AttemptMode, opened_fixture:
         }
     };
     let result = run(route, mode, vec![step]);
-    assert_script(&result, 1);
+    assert_script(route, &result, 1);
     assert!(result.delays_ms.is_empty());
     assert_one_final_diagnostic(&result, "failed");
 }
 
-fn assert_success_fixture(route: FixtureRoute, mode: AttemptMode, _fixture_name: &str) {
+fn assert_success_fixture(route: FixtureRoute, mode: AttemptMode, fixture_name: &str) {
     let result = run(route, mode, vec![success_step(route, mode)]);
-    assert_script(&result, 1);
+    assert_script(route, &result, 1);
     assert!(result.delays_ms.is_empty());
     assert_success_body(route, mode, &result);
+    let actual = match mode {
+        AttemptMode::Nonstream => result.body().to_vec(),
+        AttemptMode::Stream => result.sse_body(),
+    };
+    assert_eq!(
+        String::from_utf8_lossy(&actual),
+        expected_success_fixture(fixture_name),
+        "literal success fixture {fixture_name} changed"
+    );
     assert_one_final_diagnostic(&result, "completed");
 }
 
@@ -753,29 +781,52 @@ fn assert_redacted(route: FixtureRoute, sentinels: &[&str]) {
             UpstreamStep::json(
                 503,
                 "Unavailable",
-                failure_body(503, ErrorCode::RateLimitError),
+                failure_body(route, 503, ErrorCode::RateLimitError),
             ),
             UpstreamStep::json(
                 503,
                 "Unavailable",
-                failure_body(503, ErrorCode::RateLimitError),
+                failure_body(route, 503, ErrorCode::RateLimitError),
             ),
             UpstreamStep::json(
                 503,
                 "Unavailable",
-                failure_body(503, ErrorCode::RateLimitError),
+                failure_body(route, 503, ErrorCode::RateLimitError),
             ),
         ],
     );
-    assert_script(&result, 3);
-    let text = result.text();
+    assert_script(route, &result, 3);
+    let caller_text = result.text();
     for sentinel in sentinels {
         assert!(
-            !text.contains(sentinel),
-            "downstream/diagnostic leaked sentinel {sentinel}: {text}"
+            !caller_text.contains(sentinel),
+            "downstream leaked sentinel {sentinel}: {caller_text}"
         );
     }
+    assert_no_diagnostic_sentinels_for_test(&result.diagnostics, sentinels);
     assert_one_final_diagnostic(&result, "failed");
+}
+
+#[cfg(test)]
+fn assert_no_diagnostic_sentinels_for_test(diagnostics: &[Value], sentinels: &[&str]) {
+    let diagnostics_text =
+        serde_json::to_string(diagnostics).expect("serialize acceptance diagnostics");
+    for sentinel in sentinels {
+        assert!(
+            !diagnostics_text.contains(sentinel),
+            "diagnostic leaked sentinel {sentinel}: {diagnostics_text}"
+        );
+    }
+}
+
+fn expected_success_fixture(fixture_name: &str) -> &'static str {
+    match fixture_name {
+        "kimi-nonstream-filter" => "{\"id\":\"msg_kimi\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"kimi-k2.7-code\",\"content\":[{\"type\":\"text\",\"text\":\"kimi ok\"}],\"stop_reason\":\"end_turn\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":1,\"output_tokens\":2}}",
+        "kimi-stream-filter" => "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_stream\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"upstream\",\"content\":[],\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n\nevent: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"stream ok\"}}\n\nevent: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\nevent: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"usage\":{\"output_tokens\":2}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+        "deepseek-dsml-nonstream" => "{\"id\":\"msg_ok\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"upstream\",\"content\":[{\"type\":\"text\",\"text\":\"hello \"},{\"type\":\"tool_use\",\"id\":\"toolu_dsml_424242424242424242424242424242420000000000000001_1\",\"name\":\"web_search\",\"input\":{\"query\":\"q\"}},{\"type\":\"text\",\"text\":\" done\"}],\"stop_reason\":\"tool_use\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":1,\"output_tokens\":2}}",
+        "deepseek-dsml-stream" => "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_stream\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"upstream\",\"content\":[],\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n\nevent: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"stream ok\"}}\n\nevent: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\nevent: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"usage\":{\"output_tokens\":2}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+        other => panic!("unknown success fixture {other}"),
+    }
 }
 
 fn success_step(route: FixtureRoute, mode: AttemptMode) -> UpstreamStep {
