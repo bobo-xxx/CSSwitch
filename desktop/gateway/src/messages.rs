@@ -956,12 +956,11 @@ fn project_http_failure(
     let request_id = parse_request_id(response.headers());
     let (rate_kind, error_code) =
         match read_body_with_deadline(response, Some(MAX_ERROR_BODY_BYTES + 1), started, total) {
-            Ok(bytes) => {
-                let admitted = bytes.len().min(MAX_ERROR_BODY_BYTES as usize);
-                let _ = serde_json::from_slice::<Value>(&bytes[..admitted]);
-                project_api_failure_body(&bytes[..admitted])
+            Ok(bytes) if bytes.len() <= MAX_ERROR_BODY_BYTES as usize => {
+                let _ = serde_json::from_slice::<Value>(&bytes);
+                project_api_failure_body(&bytes)
             }
-            Err(_) => (None, ErrorCode::Absent),
+            Ok(_) | Err(_) => (None, ErrorCode::Absent),
         };
     FailureObservation::Http {
         status,
@@ -1586,6 +1585,31 @@ mod tests {
         );
         assert!(!format!("{observation:?}").contains("secret upstream text"));
         upstream.join().unwrap();
+    }
+
+    #[test]
+    fn api_key_post_once_rejects_semantics_from_oversized_failure_body() {
+        let mut body = br#"{"error":{"code":"insufficient_quota"}}"#.to_vec();
+        body.resize(MAX_ERROR_BODY_BYTES as usize, b' ');
+        body.push(b'x');
+        let response = response_with_headers(429, &body, &[]);
+        let (url, count, upstream) = spawn_counted_response(response);
+        let observation = super::post_once(&test_config(url), b"{}", AttemptMode::Nonstream)
+            .expect_err("429 is a closed observation");
+        upstream.join().unwrap();
+
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            observation,
+            FailureObservation::Http {
+                status: 429,
+                rate_kind: None,
+                retry_after_seconds: None,
+                request_id: None,
+                error_code: ErrorCode::Absent,
+                error_param: ErrorParam::Absent,
+            }
+        );
     }
 
     #[test]
