@@ -653,6 +653,18 @@ impl AttemptController {
         ))
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn internal_terminal_failure(&mut self) -> Result<(), TransitionError> {
+        if matches!(
+            self.phase,
+            AttemptPhase::TerminalPending(_) | AttemptPhase::Finalized(_)
+        ) {
+            return Err(TransitionError::ObservationNotAuthorized);
+        }
+        self.phase = AttemptPhase::TerminalPending(AttemptOutcome::Failed);
+        Ok(())
+    }
+
     pub(crate) fn completed_diagnostic(&mut self) -> Result<AttemptDiagnostic, TransitionError> {
         if self.phase != AttemptPhase::UpstreamOpen {
             return Err(TransitionError::FinalizationNotAuthorized);

@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use std::fmt;
 
 use crate::config::GatewayConfig;
@@ -38,17 +36,18 @@ pub(crate) enum OpenResult<O> {
 
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct OpenedAttempt<O> {
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) opened: O,
     controller: AttemptController,
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct TerminalAttempt {
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) failure: Option<ProviderFailure>,
     controller: AttemptController,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct ApiKeyPostOnceTransport<'a> {
     cfg: &'a GatewayConfig,
     attempt_mode: AttemptMode,
@@ -66,7 +65,37 @@ impl ApiKeyAttemptSequence {
     where
         T: ApiKeyTransport,
     {
-        let mut controller = AttemptController::new(context.clone(), false);
+        let controller = AttemptController::new(context.clone(), false);
+        Self::open_with_controller(context, controller, body, mode, transport, runtime)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn open_with_controller_for_test<T>(
+        context: RouteContext,
+        controller: AttemptController,
+        body: &[u8],
+        mode: AttemptMode,
+        transport: &mut T,
+        runtime: &mut impl AttemptRuntime,
+    ) -> OpenResult<T::Opened>
+    where
+        T: ApiKeyTransport,
+    {
+        Self::open_with_controller(context, controller, body, mode, transport, runtime)
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn open_with_controller<T>(
+        context: RouteContext,
+        mut controller: AttemptController,
+        body: &[u8],
+        mode: AttemptMode,
+        transport: &mut T,
+        runtime: &mut impl AttemptRuntime,
+    ) -> OpenResult<T::Opened>
+    where
+        T: ApiKeyTransport,
+    {
         loop {
             if runtime.cancelled() {
                 controller
@@ -115,7 +144,10 @@ impl ApiKeyAttemptSequence {
                         });
                     }
                     AttemptDirective::RepairOnce(_) => {
-                        debug_assert!(false, "API-key attempt sequence never enables repair");
+                        debug_assert!(cfg!(test), "API-key attempt sequence never enables repair");
+                        controller
+                            .internal_terminal_failure()
+                            .expect("unexpected API-key repair becomes terminal failure");
                         let failure = ProviderFailure::from_observation(
                             &context,
                             &FailureObservation::Protocol(

@@ -1,10 +1,13 @@
 use std::collections::VecDeque;
 
-use crate::api_key_attempt::{ApiKeyAttemptSequence, ApiKeyTransport, AttemptRuntime, OpenResult};
+use crate::api_key_attempt::{
+    ApiKeyAttemptSequence, ApiKeyPostOnceTransport, ApiKeyTransport, AttemptRuntime, OpenResult,
+};
+use crate::config::{GatewayConfig, GatewayIntent};
 use crate::messages::AttemptMode;
 use crate::provider_failure::{
-    CorrelationId, ErrorCode, ErrorParam, FailureObservation, ProtocolKind, ProviderId, RateKind,
-    RetryPolicy, RouteContext, RouteMode,
+    AttemptController, CorrelationId, ErrorCode, ErrorParam, FailureObservation, ProtocolKind,
+    ProviderId, RateKind, RetryPolicy, RouteContext, RouteMode, TransitionError,
 };
 
 #[derive(Debug)]
@@ -100,6 +103,17 @@ fn quota_observation() -> FailureObservation {
     }
 }
 
+fn repair_observation() -> FailureObservation {
+    FailureObservation::Http {
+        status: 400,
+        rate_kind: None,
+        retry_after_seconds: None,
+        request_id: None,
+        error_code: ErrorCode::UnsupportedValue,
+        error_param: ErrorParam::ToolChoice,
+    }
+}
+
 fn failure(status: u16) -> Result<FakeOpened, FailureObservation> {
     Err(http_observation(status, None))
 }
@@ -124,6 +138,38 @@ fn anthropic_context() -> RouteContext {
         CorrelationId::new("api-corr-anthropic").unwrap(),
         RetryPolicy::ANTHROPIC_MESSAGES,
     )
+}
+
+fn repair_enabled_test_context() -> RouteContext {
+    RouteContext {
+        provider: ProviderId::OpenaiCustom,
+        route: RouteMode::ResponsesLite,
+        correlation_id: CorrelationId::new("api-corr-repair-defensive").unwrap(),
+        retry_policy: RetryPolicy::OPENAI_CHAT,
+    }
+}
+
+fn adapter_debug_config() -> GatewayConfig {
+    GatewayConfig {
+        provider: "openai-custom".to_owned(),
+        port: 0,
+        auth_secret: None,
+        api_key: Some("secret-must-not-leak".to_owned()),
+        upstream_url: "http://127.0.0.1/unused".to_owned(),
+        models_url: None,
+        relay_thinking: None,
+        provider_contract: None,
+        intent: GatewayIntent::Formal,
+        static_model_resolver: None,
+        shim_mode: "off".to_owned(),
+        codex_state_root: None,
+        codex_contract: None,
+        launch_id: String::new(),
+        skill_data_dir: None,
+        skill_bridge_dir: None,
+        skill_bridge_token: None,
+        science_host_context: None,
+    }
 }
 
 #[test]
@@ -163,7 +209,12 @@ fn unknown_rate_limit_retries_but_quota_stops_without_repair() {
         &mut rate,
         &mut runtime,
     );
-    assert!(matches!(result, OpenResult::Opened(_)));
+    let OpenResult::Opened(mut opened) = result else {
+        panic!("unknown rate limit should retry then open")
+    };
+    let _opened_payload = &opened.opened;
+    assert_eq!(opened.snapshot().posts, 2);
+    assert!(opened.completed_diagnostic().is_ok());
     assert_eq!(runtime.delays, [500]);
 
     let mut quota = ScriptedTransport::script([Err(quota_observation())]);
@@ -192,7 +243,10 @@ fn cancellation_during_wait_and_opened_response_are_final_barriers() {
         &mut transport,
         &mut runtime,
     );
-    assert!(matches!(result, OpenResult::Cancelled(_)));
+    let OpenResult::Cancelled(mut terminal) = result else {
+        panic!("wait cancellation should stop the sequence")
+    };
+    assert!(terminal.cancelled_diagnostic().is_ok());
     assert_eq!(transport.posts(), 1);
 
     let mut opened_transport = ScriptedTransport::script([opened_success()]);
@@ -209,4 +263,54 @@ fn cancellation_during_wait_and_opened_response_are_final_barriers() {
         opened.fail_after_open(FailureObservation::Protocol(ProtocolKind::InvalidResponse));
     assert_eq!(failure.snapshot().posts, 1);
     assert_eq!(opened_transport.posts(), 1);
+
+    let mut opened_transport = ScriptedTransport::script([opened_success()]);
+    let OpenResult::Opened(mut opened) = ApiKeyAttemptSequence::open(
+        openai_context(),
+        b"{}",
+        AttemptMode::Nonstream,
+        &mut opened_transport,
+        &mut RecordingRuntime::default(),
+    ) else {
+        panic!("fixture must open");
+    };
+    assert!(opened.cancelled_diagnostic().is_ok());
+}
+
+#[test]
+fn unexpected_repair_directive_fails_closed_and_finalizes_once() {
+    let context = repair_enabled_test_context();
+    let controller = AttemptController::new(context.clone(), true);
+    let mut transport = ScriptedTransport::script([Err(repair_observation())]);
+    let result = ApiKeyAttemptSequence::open_with_controller_for_test(
+        context,
+        controller,
+        b"{}",
+        AttemptMode::Nonstream,
+        &mut transport,
+        &mut RecordingRuntime::default(),
+    );
+
+    let OpenResult::Failed(mut terminal) = result else {
+        panic!("unexpected repair directive must fail closed")
+    };
+    assert_eq!(terminal.snapshot().posts, 1);
+    assert_eq!(terminal.snapshot().repairs, 1);
+    assert_eq!(transport.posts(), 1);
+    assert!(terminal.failed_diagnostic().is_ok());
+    assert!(matches!(
+        terminal.failed_diagnostic(),
+        Err(TransitionError::FinalizationNotAuthorized)
+    ));
+}
+
+#[test]
+fn production_adapter_debug_names_provider_and_mode_without_secret() {
+    let cfg = adapter_debug_config();
+    let transport = ApiKeyPostOnceTransport::new(&cfg, AttemptMode::Nonstream);
+    let debug = format!("{transport:?}");
+
+    assert!(debug.contains("openai-custom"));
+    assert!(debug.contains("Nonstream"));
+    assert!(!debug.contains("secret-must-not-leak"));
 }
