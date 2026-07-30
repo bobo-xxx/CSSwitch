@@ -210,9 +210,7 @@ impl Write for ScriptedDeliveryWriter {
     }
 }
 
-pub(super) fn provider_delivery_result(
-    deliver: impl FnOnce(&mut dyn Write) -> std::io::Result<()>,
-) -> Option<std::io::Result<()>> {
+pub(super) fn provider_delivery_result<T>(deliver: impl FnOnce(&mut dyn Write) -> T) -> Option<T> {
     let failure = OPENAI_CHAT_DELIVERY_FAILURE.with(|slot| *slot.borrow());
     failure.map(|failure| {
         let mut writer = ScriptedDeliveryWriter::new(failure);
@@ -951,6 +949,53 @@ fn assert_diagnostic_keys(route: FixtureRoute, expected: &[&str]) {
     assert_eq!(actual, expected);
 }
 
+fn assert_diagnostic_reason(route: FixtureRoute) {
+    let completed = run(
+        route,
+        AttemptMode::Nonstream,
+        vec![success_step(route, AttemptMode::Nonstream)],
+    );
+    assert_script(route, &completed, 1);
+    assert_eq!(
+        completed.diagnostics[0]["reason"],
+        json!({"kind": "completed", "delay_count": 0})
+    );
+
+    let failed = run(
+        route,
+        AttemptMode::Nonstream,
+        vec![
+            UpstreamStep::json(
+                503,
+                "Unavailable",
+                failure_body(route, 503, ErrorCode::RateLimitError),
+            ),
+            UpstreamStep::json(
+                503,
+                "Unavailable",
+                failure_body(route, 503, ErrorCode::RateLimitError),
+            ),
+            UpstreamStep::json(
+                503,
+                "Unavailable",
+                failure_body(route, 503, ErrorCode::RateLimitError),
+            ),
+        ],
+    );
+    assert_script(route, &failed, 3);
+    assert_eq!(
+        failed.diagnostics[0]["reason"],
+        json!({
+            "kind": "failed",
+            "delay_count": 2,
+            "mapped_status": 502,
+            "upstream_status": 503,
+            "failure_class": "transient",
+            "retryable": true
+        })
+    );
+}
+
 fn assert_failure_response(route: FixtureRoute, result: &AcceptanceResult, status: u16) {
     assert_eq!(result.status(), status);
     let body = result.json();
@@ -1684,6 +1729,7 @@ fn api_contract_cross_route_diagnostic_schema_has_only_closed_fields() {
                 "reason",
             ],
         );
+        assert_diagnostic_reason(route);
     }
 }
 
@@ -1701,9 +1747,28 @@ fn api_contract_cross_route_raw_body_key_header_url_and_request_id_never_reach_d
                 "secret upstream text",
                 "private.example",
                 "Req-secret-cross-route",
+                request_id_sentinel(route),
             ],
         );
     }
+}
+
+#[test]
+fn api_contract_cross_route_delivery_uses_shared_production_path() {
+    let source = include_str!("../server.rs");
+    assert!(
+        !source
+            .contains("if api_key_acceptance::delivery_failure_enabled() {\n        let (opened"),
+        "delivery fault injection must not bypass the production stream delivery path"
+    );
+    assert!(
+        !source.contains("#[allow(dead_code)]\nfn finalize_opened_delivery"),
+        "opened delivery finalizer must be live, not dead-code allowed"
+    );
+    assert!(
+        source.matches("finalize_opened_delivery(").count() >= 3,
+        "opened delivery finalizer must be used by multiple production branches"
+    );
 }
 
 #[test]

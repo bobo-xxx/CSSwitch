@@ -303,12 +303,34 @@ pub(crate) struct AttemptDiagnostic {
     outcome: AttemptOutcome,
     posts: u8,
     repairs: u8,
-    reason: &'static str,
+    reason: AttemptReason,
     delays_ms: Vec<u64>,
     mapped_status: Option<u16>,
     upstream_status: Option<u16>,
     failure_class: Option<FailureClass>,
     retryable: Option<bool>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub(crate) struct AttemptReason {
+    kind: AttemptReasonKind,
+    delay_count: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mapped_status: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    upstream_status: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    failure_class: Option<FailureClass>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    retryable: Option<bool>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum AttemptReasonKind {
+    Completed,
+    Failed,
+    Cancelled,
 }
 
 impl ProviderFailure {
@@ -559,10 +581,17 @@ impl AttemptDiagnostic {
             outcome,
             posts: snapshot.posts,
             repairs: snapshot.repairs,
-            reason: match outcome {
-                AttemptOutcome::Completed => "completed",
-                AttemptOutcome::Failed => "failed",
-                AttemptOutcome::Cancelled => "cancelled",
+            reason: AttemptReason {
+                kind: match outcome {
+                    AttemptOutcome::Completed => AttemptReasonKind::Completed,
+                    AttemptOutcome::Failed => AttemptReasonKind::Failed,
+                    AttemptOutcome::Cancelled => AttemptReasonKind::Cancelled,
+                },
+                delay_count: snapshot.delays_ms.len(),
+                mapped_status: None,
+                upstream_status: None,
+                failure_class: None,
+                retryable: None,
             },
             delays_ms: snapshot.delays_ms,
             mapped_status: None,
@@ -587,7 +616,14 @@ impl AttemptDiagnostic {
             outcome: AttemptOutcome::Failed,
             posts,
             repairs,
-            reason: failure.failure_class.reason_code(),
+            reason: AttemptReason {
+                kind: AttemptReasonKind::Failed,
+                delay_count: delays_ms.len(),
+                mapped_status: Some(failure.status),
+                upstream_status: failure.upstream_status,
+                failure_class: Some(failure.failure_class),
+                retryable: Some(failure.retryable),
+            },
             delays_ms,
             mapped_status: Some(failure.status),
             upstream_status: failure.upstream_status,
@@ -648,22 +684,6 @@ impl Serialize for AttemptDiagnostic {
             state.serialize_field("repairs", &self.repairs)?;
             state.serialize_field("reason", &self.reason)?;
             state.end()
-        }
-    }
-}
-
-impl FailureClass {
-    fn reason_code(self) -> &'static str {
-        match self {
-            Self::Authentication => "authentication",
-            Self::Authorization => "authorization",
-            Self::InvalidRequest => "invalid_request",
-            Self::Capability => "capability",
-            Self::Quota => "quota",
-            Self::RateLimit => "rate_limit",
-            Self::Transient => "transient",
-            Self::Network => "network",
-            Self::Protocol => "protocol",
         }
     }
 }

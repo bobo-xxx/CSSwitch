@@ -92,6 +92,13 @@ enum StreamTermination {
     DownstreamWriteError,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ApiKeyStreamDelivery {
+    Completed,
+    Cancelled,
+    ProtocolFailure,
+}
+
 impl StreamFilter {
     fn feed(&mut self, chunk: &[u8]) -> Result<Vec<u8>, String> {
         match self {
@@ -690,63 +697,6 @@ fn handle_api_key_stream(
             return;
         }
     };
-    #[cfg(all(test, feature = "acceptance-build"))]
-    if api_key_acceptance::delivery_failure_enabled() {
-        let (opened, mut controller) = opened.into_parts();
-        let mut upstream = match opened.into_stream() {
-            Ok(upstream) => upstream,
-            Err(observation) => {
-                let failure = provider_failure_from_open_observation(&mut controller, observation);
-                let outcome = if api_key_acceptance::provider_delivery_result(|writer| {
-                    write_provider_failure(writer, &failure)
-                })
-                .expect("acceptance delivery hook enabled")
-                .is_ok()
-                {
-                    ApiKeyFinalOutcome::Failed(failure)
-                } else {
-                    ApiKeyFinalOutcome::Cancelled
-                };
-                finalize_api_key_controller(&mut controller, outcome);
-                return;
-            }
-        };
-        let delivery = api_key_acceptance::provider_delivery_result(|writer| {
-            write!(
-                writer,
-                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n"
-            )?;
-            writer.flush()?;
-            let termination = forward_stream_body(&mut upstream.response, &[], &mut filter, |chunk| {
-                write_chunk(writer, chunk)
-            });
-            match termination {
-                StreamTermination::NormalEof => {
-                    writer.write_all(b"0\r\n\r\n")?;
-                    writer.flush()
-                }
-                StreamTermination::DownstreamWriteError => Err(std::io::Error::new(
-                    std::io::ErrorKind::BrokenPipe,
-                    "scripted downstream write error",
-                )),
-                StreamTermination::UpstreamTerminalError
-                | StreamTermination::UpstreamReadError
-                | StreamTermination::ProtocolError => {
-                    writer.write_all(b"0\r\n\r\n")?;
-                    writer.flush()
-                }
-            }
-        })
-        .expect("acceptance delivery hook enabled");
-        let outcome = if delivery.is_ok() {
-            ApiKeyFinalOutcome::Completed
-        } else {
-            ApiKeyFinalOutcome::Cancelled
-        };
-        finalize_api_key_controller(&mut controller, outcome);
-        return;
-    }
-
     let (opened, mut controller) = opened.into_parts();
     let mut upstream = match opened.into_stream() {
         Ok(upstream) => upstream,
@@ -761,6 +711,40 @@ fn handle_api_key_stream(
             return;
         }
     };
+    match deliver_api_key_response(stream, |writer| {
+        deliver_api_key_stream_response(writer, &mut upstream, &mut filter)
+    }) {
+        ApiKeyStreamDelivery::Completed => {
+            let diagnostic = finalize_opened_delivery(&mut controller, std::io::Result::Ok(()));
+            emit_api_key_attempt_diagnostic(diagnostic);
+        }
+        ApiKeyStreamDelivery::Cancelled => {
+            let diagnostic = finalize_opened_delivery(
+                &mut controller,
+                std::io::Result::Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "downstream delivery failed",
+                )),
+            );
+            emit_api_key_attempt_diagnostic(diagnostic);
+        }
+        ApiKeyStreamDelivery::ProtocolFailure => {
+            let failure = provider_failure_from_open_observation(
+                &mut controller,
+                crate::provider_failure::FailureObservation::Protocol(
+                    crate::provider_failure::ProtocolKind::InvalidResponse,
+                ),
+            );
+            finalize_api_key_controller(&mut controller, ApiKeyFinalOutcome::Failed(failure));
+        }
+    }
+}
+
+fn deliver_api_key_stream_response<W: Write + ?Sized>(
+    stream: &mut W,
+    upstream: &mut messages::UpstreamStream,
+    filter: &mut Option<StreamFilter>,
+) -> ApiKeyStreamDelivery {
     if write!(
         stream,
         "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n"
@@ -768,10 +752,9 @@ fn handle_api_key_stream(
     .and_then(|_| stream.flush())
     .is_err()
     {
-        finalize_api_key_controller(&mut controller, ApiKeyFinalOutcome::Cancelled);
-        return;
+        return ApiKeyStreamDelivery::Cancelled;
     }
-    let termination = forward_stream_body(&mut upstream.response, &[], &mut filter, |chunk| {
+    let termination = forward_stream_body(&mut upstream.response, &[], filter, |chunk| {
         write_chunk(stream, chunk)
     });
     match termination {
@@ -779,39 +762,29 @@ fn handle_api_key_stream(
             if let Some(filter) = filter.as_ref() {
                 filter.log_stats();
             }
-            let outcome = if stream
+            if stream
                 .write_all(b"0\r\n\r\n")
                 .and_then(|_| stream.flush())
                 .is_ok()
             {
-                ApiKeyFinalOutcome::Completed
+                ApiKeyStreamDelivery::Completed
             } else {
-                ApiKeyFinalOutcome::Cancelled
-            };
-            finalize_api_key_controller(&mut controller, outcome);
+                ApiKeyStreamDelivery::Cancelled
+            }
         }
-        StreamTermination::DownstreamWriteError => {
-            finalize_api_key_controller(&mut controller, ApiKeyFinalOutcome::Cancelled);
-        }
+        StreamTermination::DownstreamWriteError => ApiKeyStreamDelivery::Cancelled,
         StreamTermination::UpstreamTerminalError
         | StreamTermination::UpstreamReadError
         | StreamTermination::ProtocolError => {
-            let failure = provider_failure_from_open_observation(
-                &mut controller,
-                crate::provider_failure::FailureObservation::Protocol(
-                    crate::provider_failure::ProtocolKind::InvalidResponse,
-                ),
-            );
-            let outcome = if stream
+            if stream
                 .write_all(b"0\r\n\r\n")
                 .and_then(|_| stream.flush())
                 .is_ok()
             {
-                ApiKeyFinalOutcome::Failed(failure)
+                ApiKeyStreamDelivery::ProtocolFailure
             } else {
-                ApiKeyFinalOutcome::Cancelled
-            };
-            finalize_api_key_controller(&mut controller, outcome);
+                ApiKeyStreamDelivery::Cancelled
+            }
         }
     }
 }
@@ -891,8 +864,7 @@ fn handle_api_key_nonstream(
             return;
         }
     };
-    #[cfg(all(test, feature = "acceptance-build"))]
-    let delivery = if let Some(result) = api_key_acceptance::provider_delivery_result(|writer| {
+    let delivery = deliver_api_key_response(stream, |writer| {
         write_response_checked(
             writer,
             resp.status,
@@ -900,31 +872,23 @@ fn handle_api_key_nonstream(
             &resp.content_type,
             &body,
         )
-    }) {
-        result
-    } else {
-        write_response_checked(
-            stream,
-            resp.status,
-            status_reason(resp.status),
-            &resp.content_type,
-            &body,
-        )
-    };
-    #[cfg(not(all(test, feature = "acceptance-build")))]
-    let delivery = write_response_checked(
-        stream,
-        resp.status,
-        status_reason(resp.status),
-        &resp.content_type,
-        &body,
-    );
-    let outcome = if delivery.is_ok() {
-        ApiKeyFinalOutcome::Completed
-    } else {
-        ApiKeyFinalOutcome::Cancelled
-    };
-    finalize_api_key_controller(&mut controller, outcome);
+    });
+    let diagnostic = finalize_opened_delivery(&mut controller, delivery);
+    emit_api_key_attempt_diagnostic(diagnostic);
+}
+
+fn deliver_api_key_response<W: Write, T>(
+    stream: &mut W,
+    deliver: impl FnOnce(&mut dyn Write) -> T,
+) -> T {
+    #[cfg(all(test, feature = "acceptance-build"))]
+    {
+        if api_key_acceptance::delivery_failure_enabled() {
+            return api_key_acceptance::provider_delivery_result(deliver)
+                .expect("acceptance delivery hook enabled");
+        }
+    }
+    deliver(stream)
 }
 
 fn deliver_openai_chat_response<W: Write + ?Sized>(
@@ -1034,22 +998,11 @@ fn handle_openai_chat_api_key(
             return;
         }
     };
-    #[cfg(all(test, feature = "acceptance-build"))]
-    let delivery = if let Some(result) = api_key_acceptance::provider_delivery_result(|writer| {
+    let delivery = deliver_api_key_response(stream, |writer| {
         deliver_openai_chat_response(writer, anthropic_resp.clone(), is_stream)
-    }) {
-        result
-    } else {
-        deliver_openai_chat_response(stream, anthropic_resp, is_stream)
-    };
-    #[cfg(not(all(test, feature = "acceptance-build")))]
-    let delivery = deliver_openai_chat_response(stream, anthropic_resp, is_stream);
-    let outcome = if delivery.is_ok() {
-        ApiKeyFinalOutcome::Completed
-    } else {
-        ApiKeyFinalOutcome::Cancelled
-    };
-    finalize_api_key_controller(&mut controller, outcome);
+    });
+    let diagnostic = finalize_opened_delivery(&mut controller, delivery);
+    emit_api_key_attempt_diagnostic(diagnostic);
 }
 
 fn handle_openai_responses_api_key(
@@ -1114,22 +1067,11 @@ fn handle_openai_responses_api_key(
         }
     };
     let anthropic_resp = openai_responses::openai_to_anthropic(&openai_resp, model_id);
-    #[cfg(all(test, feature = "acceptance-build"))]
-    let delivery = if let Some(result) = api_key_acceptance::provider_delivery_result(|writer| {
+    let delivery = deliver_api_key_response(stream, |writer| {
         deliver_openai_chat_response(writer, anthropic_resp.clone(), is_stream)
-    }) {
-        result
-    } else {
-        deliver_openai_chat_response(stream, anthropic_resp, is_stream)
-    };
-    #[cfg(not(all(test, feature = "acceptance-build")))]
-    let delivery = deliver_openai_chat_response(stream, anthropic_resp, is_stream);
-    let outcome = if delivery.is_ok() {
-        ApiKeyFinalOutcome::Completed
-    } else {
-        ApiKeyFinalOutcome::Cancelled
-    };
-    finalize_api_key_controller(&mut controller, outcome);
+    });
+    let diagnostic = finalize_opened_delivery(&mut controller, delivery);
+    emit_api_key_attempt_diagnostic(diagnostic);
 }
 
 fn log_relay_metadata(metadata: &AnthropicMetadata, is_stream: bool, message_count: usize) {
@@ -1689,7 +1631,6 @@ fn emit_api_key_attempt_diagnostic(diagnostic: crate::provider_failure::AttemptD
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum ApiKeyFinalOutcome {
-    Completed,
     Failed(crate::provider_failure::ProviderFailure),
     Cancelled,
 }
@@ -1699,9 +1640,6 @@ fn finalize_api_key_controller(
     outcome: ApiKeyFinalOutcome,
 ) {
     let diagnostic = match outcome {
-        ApiKeyFinalOutcome::Completed => controller
-            .completed_diagnostic()
-            .expect("completed API-key attempt finalizes exactly once"),
         ApiKeyFinalOutcome::Failed(failure) => controller
             .failed_diagnostic(&failure)
             .expect("failed API-key attempt finalizes exactly once"),
@@ -1726,17 +1664,16 @@ fn deliver_provider_failure<W: Write + ?Sized>(
     }
 }
 
-#[allow(dead_code)]
 fn finalize_opened_delivery(
-    mut opened: crate::api_key_attempt::OpenedAttempt<messages::OpenedInferenceResponse>,
+    controller: &mut crate::provider_failure::AttemptController,
     delivery: std::io::Result<()>,
 ) -> crate::provider_failure::AttemptDiagnostic {
     if delivery.is_ok() {
-        opened
+        controller
             .completed_diagnostic()
             .expect("completed API-key opened attempt finalizes once")
     } else {
-        opened
+        controller
             .cancelled_diagnostic()
             .expect("cancelled API-key opened attempt finalizes once")
     }

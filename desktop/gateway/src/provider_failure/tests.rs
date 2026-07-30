@@ -253,6 +253,48 @@ fn diagnostic_schema_has_no_arbitrary_string_slot() {
     );
 }
 
+#[test]
+fn api_key_diagnostic_reason_is_closed_structured_projection() {
+    let context = api_context(
+        ProviderId::Qwen,
+        RouteMode::OpenaiChat,
+        RetryPolicy::OPENAI_CHAT,
+    );
+    let failure = ProviderFailure::from_observation(
+        &context,
+        &FailureObservation::Http {
+            status: 503,
+            rate_kind: None,
+            retry_after_seconds: None,
+            request_id: RequestId::new("Req-secret-03"),
+            error_code: ErrorCode::RateLimitError,
+            error_param: ErrorParam::Absent,
+        },
+        true,
+    );
+    let diagnostic = AttemptDiagnostic::failed(&context, 3, 0, vec![500, 1_000], &failure);
+    assert_eq!(
+        serde_json::to_value(diagnostic).unwrap(),
+        serde_json::json!({
+            "schema_version": 1,
+            "provider": "qwen",
+            "route": "openai_chat",
+            "correlation_id": "api-corr-0001",
+            "outcome": "failed",
+            "posts": 3,
+            "repairs": 0,
+            "reason": {
+                "kind": "failed",
+                "delay_count": 2,
+                "mapped_status": 502,
+                "upstream_status": 503,
+                "failure_class": "transient",
+                "retryable": true
+            }
+        })
+    );
+}
+
 fn http(
     status: u16,
     rate_kind: Option<RateKind>,
