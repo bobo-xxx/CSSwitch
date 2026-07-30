@@ -424,6 +424,14 @@ impl ProviderFailure {
                 exhausted,
                 "Start a new request after the provider recovers",
             ),
+            FailureObservation::Http { status, .. } if (300..=399).contains(status) => (
+                *status,
+                "api_error",
+                "Provider returned a redirect",
+                FailureClass::Protocol,
+                false,
+                "Use the configured provider endpoint directly before starting a new request",
+            ),
             FailureObservation::Http { status, .. } if (400..=499).contains(status) => (
                 *status,
                 "invalid_request_error",

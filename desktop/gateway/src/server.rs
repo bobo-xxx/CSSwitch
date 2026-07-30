@@ -850,6 +850,129 @@ fn handle_api_key_nonstream(
     finalize_api_key_controller(&mut controller, outcome);
 }
 
+fn handle_openai_chat_api_key(
+    stream: &mut TcpStream,
+    cfg: &GatewayConfig,
+    body: Vec<u8>,
+    model_id: &str,
+    target_model: &str,
+    reasoning_signer: &openai_chat::ReasoningSigner,
+    is_stream: bool,
+) {
+    let context = match api_key_route_context(cfg) {
+        Ok(context) => context,
+        Err(error) => {
+            api_error_json(stream, 500, &error);
+            return;
+        }
+    };
+    let mut transport = ApiKeyPostOnceTransport::new(cfg, messages::AttemptMode::Nonstream);
+    let mut runtime = ProductionProviderAttemptRuntime::new(stream);
+    let opened = match ApiKeyAttemptSequence::open(
+        context,
+        &body,
+        messages::AttemptMode::Nonstream,
+        &mut transport,
+        &mut runtime,
+    ) {
+        OpenResult::Opened(opened) => opened,
+        OpenResult::Failed(terminal) | OpenResult::Cancelled(terminal) => {
+            finalize_api_key_terminal(stream, terminal);
+            return;
+        }
+    };
+    let (opened, mut controller) = opened.into_parts();
+    let resp = match opened.into_nonstream() {
+        Ok(resp) => resp,
+        Err(observation) => {
+            let failure = provider_failure_from_open_observation(&mut controller, observation);
+            let outcome = if write_provider_failure(stream, &failure).is_ok() {
+                ApiKeyFinalOutcome::Failed(failure)
+            } else {
+                ApiKeyFinalOutcome::Cancelled
+            };
+            finalize_api_key_controller(&mut controller, outcome);
+            return;
+        }
+    };
+    let openai_resp: Value = match serde_json::from_slice(&resp.body) {
+        Ok(value) => value,
+        Err(_) => {
+            let failure = provider_failure_from_open_observation(
+                &mut controller,
+                crate::provider_failure::FailureObservation::Protocol(
+                    crate::provider_failure::ProtocolKind::InvalidResponse,
+                ),
+            );
+            let outcome = if write_provider_failure(stream, &failure).is_ok() {
+                ApiKeyFinalOutcome::Failed(failure)
+            } else {
+                ApiKeyFinalOutcome::Cancelled
+            };
+            finalize_api_key_controller(&mut controller, outcome);
+            return;
+        }
+    };
+    let anthropic_resp = match openai_chat::openai_to_anthropic(
+        &openai_resp,
+        model_id,
+        target_model,
+        reasoning_signer,
+    ) {
+        Ok(response) => response,
+        Err(_) => {
+            let failure = provider_failure_from_open_observation(
+                &mut controller,
+                crate::provider_failure::FailureObservation::Protocol(
+                    crate::provider_failure::ProtocolKind::InvalidResponse,
+                ),
+            );
+            let outcome = if write_provider_failure(stream, &failure).is_ok() {
+                ApiKeyFinalOutcome::Failed(failure)
+            } else {
+                ApiKeyFinalOutcome::Cancelled
+            };
+            finalize_api_key_controller(&mut controller, outcome);
+            return;
+        }
+    };
+    if is_stream {
+        if write!(
+            stream,
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n"
+        )
+        .and_then(|_| stream.flush())
+        .is_err()
+        {
+            finalize_api_key_controller(&mut controller, ApiKeyFinalOutcome::Cancelled);
+            return;
+        }
+        for (event, data) in openai_chat::replay_as_sse_events(&anthropic_resp) {
+            if write_chunk(stream, &sse_event(&event, &data)).is_err() {
+                finalize_api_key_controller(&mut controller, ApiKeyFinalOutcome::Cancelled);
+                return;
+            }
+        }
+        let outcome = if stream
+            .write_all(b"0\r\n\r\n")
+            .and_then(|_| stream.flush())
+            .is_ok()
+        {
+            ApiKeyFinalOutcome::Completed
+        } else {
+            ApiKeyFinalOutcome::Cancelled
+        };
+        finalize_api_key_controller(&mut controller, outcome);
+    } else {
+        let outcome = if write_json_checked(stream, 200, "OK", anthropic_resp).is_ok() {
+            ApiKeyFinalOutcome::Completed
+        } else {
+            ApiKeyFinalOutcome::Cancelled
+        };
+        finalize_api_key_controller(&mut controller, outcome);
+    }
+}
+
 fn log_relay_metadata(metadata: &AnthropicMetadata, is_stream: bool, message_count: usize) {
     let rules = if metadata.rule_ids.is_empty() {
         "-".to_string()
@@ -2002,6 +2125,18 @@ fn handle_messages(
         };
         if let Some(metadata) = responses_metadata.as_ref() {
             log_responses_metadata(&transformed, metadata, is_stream);
+        }
+        if cfg.provider != "openai-responses" {
+            handle_openai_chat_api_key(
+                stream,
+                cfg,
+                body,
+                &model_id,
+                &target_model,
+                &reasoning_signer,
+                is_stream,
+            );
+            return;
         }
         match messages::post_nonstream(cfg, body) {
             Ok(resp) => {

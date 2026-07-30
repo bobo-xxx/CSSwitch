@@ -1,7 +1,8 @@
 use std::cell::RefCell;
 use std::collections::{BTreeMap, VecDeque};
 use std::io::{ErrorKind, Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
+use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -73,12 +74,23 @@ enum FixtureRoute {
     RelayAnthropic,
     RelayKimi,
     DeepseekAnthropic,
+    QwenChat,
+    OpenaiCustomChat,
+    GeminiChat,
+    GrokChat,
+    OpenCodeGoChat,
 }
 
 #[derive(Clone, Copy, Debug)]
 enum OpenedFixture {
     MalformedJson,
     PartialSseThenClose,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum DeliveryFailure {
+    ChunkWrite,
+    FinalFlush,
 }
 
 #[derive(Clone, Debug)]
@@ -222,8 +234,18 @@ impl ScriptedUpstream {
         }
     }
 
-    fn endpoint(&self) -> String {
-        format!("http://{}/v1/messages", self.address)
+    fn endpoint(&self, route: FixtureRoute) -> String {
+        let path = match route {
+            FixtureRoute::RelayAnthropic
+            | FixtureRoute::RelayKimi
+            | FixtureRoute::DeepseekAnthropic => "/v1/messages",
+            FixtureRoute::QwenChat
+            | FixtureRoute::OpenaiCustomChat
+            | FixtureRoute::GeminiChat
+            | FixtureRoute::GrokChat
+            | FixtureRoute::OpenCodeGoChat => "/v1/chat/completions",
+        };
+        format!("http://{}{}", self.address, path)
     }
 
     fn finish(mut self) -> ScriptResult {
@@ -419,6 +441,52 @@ fn capture_downstream(handler: impl FnOnce(&mut TcpStream)) -> Vec<u8> {
     reader.join().expect("join downstream reader")
 }
 
+fn capture_downstream_until(
+    pattern: &'static [u8],
+) -> impl FnOnce(Box<dyn FnOnce(&mut TcpStream) + Send>) -> Vec<u8> {
+    move |handler| {
+        let listener = bind_loopback();
+        let address = listener.local_addr().expect("read downstream address");
+        let reader = thread::spawn(move || {
+            let mut stream = TcpStream::connect(address).expect("connect downstream reader");
+            let mut response = Vec::new();
+            let mut buffer = [0_u8; 64];
+            loop {
+                let read = stream.read(&mut buffer).expect("read downstream response");
+                if read == 0 {
+                    break;
+                }
+                response.extend_from_slice(&buffer[..read]);
+                if response
+                    .windows(pattern.len())
+                    .any(|candidate| candidate == pattern)
+                {
+                    let linger = libc::linger {
+                        l_onoff: 1,
+                        l_linger: 0,
+                    };
+                    let _ = unsafe {
+                        libc::setsockopt(
+                            stream.as_raw_fd(),
+                            libc::SOL_SOCKET,
+                            libc::SO_LINGER,
+                            &linger as *const libc::linger as *const libc::c_void,
+                            std::mem::size_of_val(&linger) as libc::socklen_t,
+                        )
+                    };
+                    let _ = stream.shutdown(Shutdown::Both);
+                    break;
+                }
+            }
+            response
+        });
+        let (mut stream, _) = listener.accept().expect("accept downstream");
+        handler(&mut stream);
+        drop(stream);
+        reader.join().expect("join downstream reader")
+    }
+}
+
 fn fingerprint_text(digest: &mut Sha256, value: &str) {
     digest.update((value.len() as u32).to_be_bytes());
     digest.update(value.as_bytes());
@@ -484,6 +552,26 @@ fn config(route: FixtureRoute, upstream_url: String) -> GatewayConfig {
             "kimi-k2.7-code",
             Some("enabled".to_owned()),
         ),
+        FixtureRoute::QwenChat => ("qwen", "qwen-native", "qwen-max", None),
+        FixtureRoute::OpenaiCustomChat => (
+            "openai-custom",
+            "custom-openai-chat",
+            "openai-custom-model",
+            None,
+        ),
+        FixtureRoute::GeminiChat => (
+            "openai-custom",
+            "gemini-openai-chat",
+            "gemini-2.5-pro",
+            None,
+        ),
+        FixtureRoute::GrokChat => ("openai-custom", "grok-openai-chat", "grok-4", None),
+        FixtureRoute::OpenCodeGoChat => (
+            "openai-custom",
+            "opencode-go-openai-chat",
+            "opencode-go-chat",
+            None,
+        ),
     };
     let digest = provider_contract_catalog_digest();
     let contract =
@@ -538,12 +626,21 @@ fn request(mode: AttemptMode, include_tools: bool) -> Value {
 }
 
 fn run(route: FixtureRoute, mode: AttemptMode, steps: Vec<UpstreamStep>) -> AcceptanceResult {
+    run_with_downstream(route, mode, steps, |handler| capture_downstream(handler))
+}
+
+fn run_with_downstream(
+    route: FixtureRoute,
+    mode: AttemptMode,
+    steps: Vec<UpstreamStep>,
+    capture: impl FnOnce(Box<dyn FnOnce(&mut TcpStream) + Send>) -> Vec<u8>,
+) -> AcceptanceResult {
     let upstream = ScriptedUpstream::start(steps);
-    let cfg = config(route, upstream.endpoint());
+    let cfg = config(route, upstream.endpoint(route));
     let request_nonces = RequestNonceGenerator::with_prefix([0x42; 16]);
     let relay_models = models::RelayModelCache::default();
     start_recording();
-    let downstream = capture_downstream(|stream| {
+    let downstream = capture(Box::new(move |stream| {
         handle_messages(
             stream,
             &cfg,
@@ -556,7 +653,7 @@ fn run(route: FixtureRoute, mode: AttemptMode, steps: Vec<UpstreamStep>) -> Acce
             &relay_models,
             CodexComponents::default(),
         );
-    });
+    }));
     let recording = finish_recording();
     AcceptanceResult {
         downstream,
@@ -570,6 +667,11 @@ fn request_id_sentinel(route: FixtureRoute) -> &'static str {
     match route {
         FixtureRoute::RelayAnthropic | FixtureRoute::RelayKimi => "Req-secret-01",
         FixtureRoute::DeepseekAnthropic => "Req-secret-02",
+        FixtureRoute::QwenChat
+        | FixtureRoute::OpenaiCustomChat
+        | FixtureRoute::GeminiChat
+        | FixtureRoute::GrokChat
+        | FixtureRoute::OpenCodeGoChat => "Req-secret-03",
     }
 }
 
@@ -601,26 +703,53 @@ fn assert_script(route: FixtureRoute, result: &AcceptanceResult, expected_posts:
     assert_eq!(result.script.rejected_requests, 0);
     for request in &result.script.requests {
         assert_eq!(request.method, "POST");
-        assert_eq!(request.path, "/v1/messages");
-        assert_eq!(
-            request.headers.get("x-api-key").map(String::as_str),
-            Some(API_KEY_SENTINEL),
-            "synthetic API key must be sent upstream"
-        );
-        if matches!(
-            route,
-            FixtureRoute::RelayAnthropic | FixtureRoute::RelayKimi
-        ) {
-            assert_eq!(
-                request.headers.get("authorization").map(String::as_str),
-                Some("Bearer fixture-api-key"),
-                "relay dual auth must include synthetic bearer"
-            );
-        } else {
-            assert!(
-                !request.headers.contains_key("authorization"),
-                "DeepSeek x-api-key auth must not add bearer auth"
-            );
+        match route {
+            FixtureRoute::RelayAnthropic | FixtureRoute::RelayKimi => {
+                assert_eq!(request.path, "/v1/messages");
+                assert_eq!(
+                    request.headers.get("x-api-key").map(String::as_str),
+                    Some(API_KEY_SENTINEL),
+                    "Anthropic relay dual auth must include synthetic x-api-key"
+                );
+                assert_eq!(
+                    request.headers.get("authorization").map(String::as_str),
+                    Some("Bearer fixture-api-key"),
+                    "Anthropic relay dual auth must include synthetic bearer"
+                );
+            }
+            FixtureRoute::DeepseekAnthropic => {
+                assert_eq!(request.path, "/v1/messages");
+                assert_eq!(
+                    request.headers.get("x-api-key").map(String::as_str),
+                    Some(API_KEY_SENTINEL),
+                    "DeepSeek x-api-key auth must send synthetic API key"
+                );
+                assert!(
+                    !request.headers.contains_key("authorization"),
+                    "DeepSeek x-api-key auth must not add bearer auth"
+                );
+            }
+            FixtureRoute::QwenChat
+            | FixtureRoute::OpenaiCustomChat
+            | FixtureRoute::GeminiChat
+            | FixtureRoute::GrokChat
+            | FixtureRoute::OpenCodeGoChat => {
+                assert_eq!(request.path, "/v1/chat/completions");
+                assert!(
+                    !request.headers.contains_key("x-api-key"),
+                    "OpenAI Chat bearer auth must not add x-api-key"
+                );
+                assert_eq!(
+                    request.headers.get("authorization").map(String::as_str),
+                    Some("Bearer fixture-api-key"),
+                    "OpenAI Chat routes must send synthetic bearer"
+                );
+                let body: Value =
+                    serde_json::from_slice(&request.body).expect("OpenAI Chat request JSON");
+                assert_eq!(body["model"], expected_upstream_model(route));
+                assert_eq!(body["messages"][0]["role"], "user");
+                assert_eq!(body["messages"][0]["content"], "hello");
+            }
         }
         assert!(!String::from_utf8_lossy(&request.body).contains(API_KEY_SENTINEL));
     }
@@ -640,11 +769,21 @@ fn assert_one_final_diagnostic(result: &AcceptanceResult, expected_outcome: &str
     assert_eq!(result.diagnostics[0]["outcome"], expected_outcome);
 }
 
-fn assert_failure_response(result: &AcceptanceResult, status: u16) {
+fn assert_failure_response(route: FixtureRoute, result: &AcceptanceResult, status: u16) {
     assert_eq!(result.status(), status);
     let body = result.json();
     assert_eq!(body["type"], "error");
-    assert_eq!(body["error"]["route"], "anthropic_messages");
+    let expected_route = match route {
+        FixtureRoute::RelayAnthropic
+        | FixtureRoute::RelayKimi
+        | FixtureRoute::DeepseekAnthropic => "anthropic_messages",
+        FixtureRoute::QwenChat
+        | FixtureRoute::OpenaiCustomChat
+        | FixtureRoute::GeminiChat
+        | FixtureRoute::GrokChat
+        | FixtureRoute::OpenCodeGoChat => "openai_chat",
+    };
+    assert_eq!(body["error"]["route"], expected_route);
     assert!(body["error"]["provider"].as_str().is_some());
     assert!(body["error"]["correlation_id"].as_str().is_some());
     assert!(body["error"]["message"]
@@ -670,7 +809,7 @@ fn assert_terminal_http(
     );
     assert_script(route, &result, expected_posts);
     assert!(result.delays_ms.is_empty());
-    assert_failure_response(&result, status);
+    assert_failure_response(route, &result, status);
     assert_one_final_diagnostic(&result, "failed");
 }
 
@@ -737,7 +876,7 @@ fn assert_exhausted(
     );
     assert_script(route, &result, 3);
     assert_eq!(result.delays_ms, expected_delays_ms);
-    assert_failure_response(&result, 502);
+    assert_failure_response(route, &result, 502);
     assert_one_final_diagnostic(&result, "failed");
 }
 
@@ -771,6 +910,22 @@ fn assert_success_fixture(route: FixtureRoute, mode: AttemptMode, fixture_name: 
         "literal success fixture {fixture_name} changed"
     );
     assert_one_final_diagnostic(&result, "completed");
+}
+
+fn assert_delivery_failure(route: FixtureRoute, mode: AttemptMode, failure: DeliveryFailure) {
+    let close_after: &'static [u8] = match failure {
+        DeliveryFailure::ChunkWrite => b"content-type: text/event-stream",
+        DeliveryFailure::FinalFlush => b"event: ping",
+    };
+    let result = run_with_downstream(
+        route,
+        mode,
+        vec![success_step(route, mode)],
+        capture_downstream_until(close_after),
+    );
+    assert_script(route, &result, 1);
+    assert!(result.delays_ms.is_empty());
+    assert_one_final_diagnostic(&result, "cancelled");
 }
 
 fn assert_redacted(route: FixtureRoute, sentinels: &[&str]) {
@@ -825,15 +980,57 @@ fn expected_success_fixture(fixture_name: &str) -> &'static str {
         "kimi-stream-filter" => "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_stream\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"upstream\",\"content\":[],\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n\nevent: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"stream ok\"}}\n\nevent: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\nevent: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"usage\":{\"output_tokens\":2}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
         "deepseek-dsml-nonstream" => "{\"id\":\"msg_ok\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"upstream\",\"content\":[{\"type\":\"text\",\"text\":\"hello \"},{\"type\":\"tool_use\",\"id\":\"toolu_dsml_424242424242424242424242424242420000000000000001_1\",\"name\":\"web_search\",\"input\":{\"query\":\"q\"}},{\"type\":\"text\",\"text\":\" done\"}],\"stop_reason\":\"tool_use\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":1,\"output_tokens\":2}}",
         "deepseek-dsml-stream" => "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_stream\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"upstream\",\"content\":[],\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n\nevent: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"stream ok\"}}\n\nevent: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\nevent: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"usage\":{\"output_tokens\":2}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+        "qwen-chat" => "{\"id\":\"chatcmpl_qwen\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-sonnet-4-20250514\",\"content\":[{\"type\":\"text\",\"text\":\"qwen ok\"}],\"stop_reason\":\"end_turn\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":3,\"output_tokens\":4}}",
+        "openai-custom-chat" => "{\"id\":\"chatcmpl_custom\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-sonnet-4-20250514\",\"content\":[{\"type\":\"text\",\"text\":\"custom ok\"}],\"stop_reason\":\"end_turn\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":3,\"output_tokens\":4}}",
+        "gemini-chat" => "{\"id\":\"chatcmpl_gemini\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-sonnet-4-20250514\",\"content\":[{\"type\":\"text\",\"text\":\"gemini ok\"}],\"stop_reason\":\"end_turn\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":3,\"output_tokens\":4}}",
+        "grok-chat" => "{\"id\":\"chatcmpl_grok\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-sonnet-4-20250514\",\"content\":[{\"type\":\"text\",\"text\":\"grok ok\"}],\"stop_reason\":\"end_turn\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":3,\"output_tokens\":4}}",
+        "opencode-go-chat" => "{\"id\":\"chatcmpl_opencode_go\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-sonnet-4-20250514\",\"content\":[{\"type\":\"text\",\"text\":\"opencode go ok\"}],\"stop_reason\":\"end_turn\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":3,\"output_tokens\":4}}",
+        "openai-chat-local-sse-replay" => "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"chatcmpl_custom\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-sonnet-4-20250514\",\"content\":[],\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{\"input_tokens\":3,\"output_tokens\":4}}}\n\nevent: ping\ndata: {\"type\":\"ping\"}\n\nevent: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"custom ok\"}}\n\nevent: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\nevent: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"usage\":{\"output_tokens\":4}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
         other => panic!("unknown success fixture {other}"),
     }
+}
+
+fn expected_upstream_model(route: FixtureRoute) -> &'static str {
+    match route {
+        FixtureRoute::RelayAnthropic => "relay-claude",
+        FixtureRoute::RelayKimi => "kimi-k2.7-code",
+        FixtureRoute::DeepseekAnthropic => "deepseek-chat",
+        FixtureRoute::QwenChat => "qwen-max",
+        FixtureRoute::OpenaiCustomChat => "openai-custom-model",
+        FixtureRoute::GeminiChat => "gemini-2.5-pro",
+        FixtureRoute::GrokChat => "grok-4",
+        FixtureRoute::OpenCodeGoChat => "opencode-go-chat",
+    }
+}
+
+fn openai_chat_success_body(route: FixtureRoute) -> Value {
+    let (id, text) = match route {
+        FixtureRoute::QwenChat => ("chatcmpl_qwen", "qwen ok"),
+        FixtureRoute::OpenaiCustomChat => ("chatcmpl_custom", "custom ok"),
+        FixtureRoute::GeminiChat => ("chatcmpl_gemini", "gemini ok"),
+        FixtureRoute::GrokChat => ("chatcmpl_grok", "grok ok"),
+        FixtureRoute::OpenCodeGoChat => ("chatcmpl_opencode_go", "opencode go ok"),
+        _ => unreachable!("OpenAI Chat success body requires OpenAI Chat route"),
+    };
+    json!({
+        "id": id,
+        "object": "chat.completion",
+        "created": 1_700_000_000_u64,
+        "model": expected_upstream_model(route),
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": text},
+            "finish_reason": "stop"
+        }],
+        "usage": {"prompt_tokens": 3, "completion_tokens": 4, "total_tokens": 7}
+    })
 }
 
 fn success_step(route: FixtureRoute, mode: AttemptMode) -> UpstreamStep {
     match mode {
         AttemptMode::Nonstream => {
-            let body = if matches!(route, FixtureRoute::RelayKimi) {
-                json!({
+            let body = match route {
+                FixtureRoute::RelayKimi => json!({
                     "id": "msg_kimi",
                     "type": "message",
                     "role": "assistant",
@@ -845,9 +1042,8 @@ fn success_step(route: FixtureRoute, mode: AttemptMode) -> UpstreamStep {
                     "stop_reason": "end_turn",
                     "stop_sequence": null,
                     "usage": {"input_tokens": 1, "output_tokens": 2}
-                })
-            } else {
-                json!({
+                }),
+                FixtureRoute::RelayAnthropic | FixtureRoute::DeepseekAnthropic => json!({
                     "id": "msg_ok",
                     "type": "message",
                     "role": "assistant",
@@ -856,16 +1052,30 @@ fn success_step(route: FixtureRoute, mode: AttemptMode) -> UpstreamStep {
                     "stop_reason": "end_turn",
                     "stop_sequence": null,
                     "usage": {"input_tokens": 1, "output_tokens": 2}
-                })
+                }),
+                FixtureRoute::QwenChat
+                | FixtureRoute::OpenaiCustomChat
+                | FixtureRoute::GeminiChat
+                | FixtureRoute::GrokChat
+                | FixtureRoute::OpenCodeGoChat => openai_chat_success_body(route),
             };
             UpstreamStep::json(200, "OK", body)
         }
-        AttemptMode::Stream => UpstreamStep::bytes(
-            200,
-            "OK",
-            "text/event-stream",
-            b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_stream\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"upstream\",\"content\":[],\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n\nevent: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"stream ok\"}}\n\nevent: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\nevent: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"usage\":{\"output_tokens\":2}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n".to_vec(),
-        ),
+        AttemptMode::Stream => match route {
+            FixtureRoute::QwenChat
+            | FixtureRoute::OpenaiCustomChat
+            | FixtureRoute::GeminiChat
+            | FixtureRoute::GrokChat
+            | FixtureRoute::OpenCodeGoChat => UpstreamStep::json(200, "OK", openai_chat_success_body(route)),
+            FixtureRoute::RelayAnthropic | FixtureRoute::RelayKimi | FixtureRoute::DeepseekAnthropic => {
+                UpstreamStep::bytes(
+                    200,
+                    "OK",
+                    "text/event-stream",
+                    b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_stream\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"upstream\",\"content\":[],\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n\nevent: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"stream ok\"}}\n\nevent: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\nevent: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"usage\":{\"output_tokens\":2}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n".to_vec(),
+                )
+            }
+        },
     }
 }
 
@@ -885,6 +1095,17 @@ fn assert_success_body(route: FixtureRoute, mode: AttemptMode, result: &Acceptan
             if matches!(route, FixtureRoute::RelayKimi) {
                 assert!(!text.contains("\"type\":\"thinking\""));
                 assert!(text.contains("kimi ok"));
+            }
+            if matches!(
+                route,
+                FixtureRoute::QwenChat
+                    | FixtureRoute::OpenaiCustomChat
+                    | FixtureRoute::GeminiChat
+                    | FixtureRoute::GrokChat
+                    | FixtureRoute::OpenCodeGoChat
+            ) {
+                assert_eq!(body["model"], "claude-sonnet-4-20250514");
+                assert_eq!(body["content"][0]["type"], "text");
             }
         }
         AttemptMode::Stream => {
@@ -1005,6 +1226,91 @@ fn api_contract_anthropic_kimi_and_deepseek_success_fixtures_are_unchanged() {
         FixtureRoute::DeepseekAnthropic,
         AttemptMode::Stream,
         "deepseek-dsml-stream",
+    );
+}
+
+#[test]
+fn api_contract_openai_chat_conflict_rate_and_5xx_retry_with_identical_body() {
+    assert_retry_then_success(
+        FixtureRoute::OpenaiCustomChat,
+        AttemptMode::Nonstream,
+        409,
+        None,
+        500,
+    );
+    assert_retry_then_success(
+        FixtureRoute::QwenChat,
+        AttemptMode::Nonstream,
+        429,
+        None,
+        500,
+    );
+    assert_exhausted(
+        FixtureRoute::GeminiChat,
+        AttemptMode::Nonstream,
+        500,
+        &[500, 1_000],
+    );
+}
+
+#[test]
+fn api_contract_openai_chat_permanent_auth_quota_and_redirect_are_terminal() {
+    for status in [400, 401, 403, 422, 307] {
+        assert_terminal_http(
+            FixtureRoute::OpenaiCustomChat,
+            AttemptMode::Nonstream,
+            status,
+            ErrorCode::Absent,
+            1,
+        );
+    }
+    assert_terminal_http(
+        FixtureRoute::QwenChat,
+        AttemptMode::Nonstream,
+        429,
+        ErrorCode::InsufficientQuota,
+        1,
+    );
+}
+
+#[test]
+fn api_contract_openai_chat_malformed_success_never_replays() {
+    assert_opened_failure(
+        FixtureRoute::OpenaiCustomChat,
+        AttemptMode::Nonstream,
+        OpenedFixture::MalformedJson,
+    );
+}
+
+#[test]
+fn api_contract_openai_chat_qwen_custom_gemini_grok_success_is_compatible() {
+    for (route, fixture) in [
+        (FixtureRoute::QwenChat, "qwen-chat"),
+        (FixtureRoute::OpenaiCustomChat, "openai-custom-chat"),
+        (FixtureRoute::GeminiChat, "gemini-chat"),
+        (FixtureRoute::GrokChat, "grok-chat"),
+        (FixtureRoute::OpenCodeGoChat, "opencode-go-chat"),
+    ] {
+        assert_success_fixture(route, AttemptMode::Nonstream, fixture);
+    }
+}
+
+#[test]
+fn api_contract_openai_chat_stream_replay_delivery_controls_final_outcome() {
+    assert_success_fixture(
+        FixtureRoute::OpenaiCustomChat,
+        AttemptMode::Stream,
+        "openai-chat-local-sse-replay",
+    );
+    assert_delivery_failure(
+        FixtureRoute::OpenaiCustomChat,
+        AttemptMode::Stream,
+        DeliveryFailure::ChunkWrite,
+    );
+    assert_delivery_failure(
+        FixtureRoute::OpenaiCustomChat,
+        AttemptMode::Stream,
+        DeliveryFailure::FinalFlush,
     );
 }
 
