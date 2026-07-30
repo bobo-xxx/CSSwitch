@@ -1,8 +1,7 @@
 use std::cell::RefCell;
 use std::collections::{BTreeMap, VecDeque};
-use std::io::{ErrorKind, Read, Write};
-use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
-use std::os::fd::AsRawFd;
+use std::io::{Error, ErrorKind, Read, Write};
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -29,12 +28,14 @@ const MAX_REQUEST_TOTAL_BYTES: usize = MAX_REQUEST_HEADER_BYTES + MAX_REQUEST_BO
 
 thread_local! {
     static API_KEY_ACCEPTANCE_RECORDING: RefCell<Option<RecordingState>> = const { RefCell::new(None) };
+    static OPENAI_CHAT_DELIVERY_FAILURE: RefCell<Option<DeliveryFailure>> = const { RefCell::new(None) };
 }
 
 #[derive(Default)]
 struct RecordingState {
     delays_ms: Vec<u64>,
     diagnostics: Vec<Value>,
+    delivery_evidence: Option<DeliveryEvidence>,
 }
 
 pub(super) fn record_attempt_delay(delay_ms: u64) {
@@ -51,6 +52,14 @@ pub(super) fn record_attempt_diagnostic(diagnostic: AttemptDiagnostic) {
             state
                 .diagnostics
                 .push(serde_json::to_value(diagnostic).expect("serialize attempt diagnostic"));
+        }
+    });
+}
+
+fn record_delivery_evidence(evidence: DeliveryEvidence) {
+    API_KEY_ACCEPTANCE_RECORDING.with(|slot| {
+        if let Some(state) = slot.borrow_mut().as_mut() {
+            state.delivery_evidence = Some(evidence);
         }
     });
 }
@@ -91,6 +100,74 @@ enum OpenedFixture {
 enum DeliveryFailure {
     ChunkWrite,
     FinalFlush,
+}
+
+#[derive(Clone, Debug, Default)]
+struct DeliveryEvidence {
+    chunk_write_error: bool,
+    terminal_write_seen: bool,
+    final_flush_error: bool,
+}
+
+#[derive(Clone, Debug)]
+struct ScriptedDeliveryWriter {
+    failure: DeliveryFailure,
+    evidence: DeliveryEvidence,
+}
+
+impl ScriptedDeliveryWriter {
+    fn new(failure: DeliveryFailure) -> Self {
+        Self {
+            failure,
+            evidence: DeliveryEvidence::default(),
+        }
+    }
+}
+
+impl Write for ScriptedDeliveryWriter {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        if matches!(self.failure, DeliveryFailure::ChunkWrite)
+            && buffer
+                .windows(b"event: content_block_start".len())
+                .any(|candidate| candidate == b"event: content_block_start")
+        {
+            self.evidence.chunk_write_error = true;
+            return Err(Error::new(
+                ErrorKind::BrokenPipe,
+                "scripted OpenAI Chat chunk write failure",
+            ));
+        }
+        if buffer.windows(5).any(|candidate| candidate == b"0\r\n\r\n") {
+            self.evidence.terminal_write_seen = true;
+        }
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        if matches!(self.failure, DeliveryFailure::FinalFlush) && self.evidence.terminal_write_seen
+        {
+            self.evidence.final_flush_error = true;
+            return Err(Error::new(
+                ErrorKind::BrokenPipe,
+                "scripted OpenAI Chat final flush failure",
+            ));
+        }
+        Ok(())
+    }
+}
+
+pub(super) fn openai_chat_delivery_result(
+    anthropic_resp: &Value,
+    is_stream: bool,
+) -> Option<std::io::Result<()>> {
+    let failure = OPENAI_CHAT_DELIVERY_FAILURE.with(|slot| *slot.borrow());
+    failure.map(|failure| {
+        let mut writer = ScriptedDeliveryWriter::new(failure);
+        let result =
+            super::deliver_openai_chat_response(&mut writer, anthropic_resp.clone(), is_stream);
+        record_delivery_evidence(writer.evidence);
+        result
+    })
 }
 
 #[derive(Clone, Debug)]
@@ -280,6 +357,7 @@ struct AcceptanceResult {
     script: ScriptResult,
     delays_ms: Vec<u64>,
     diagnostics: Vec<Value>,
+    delivery_evidence: Option<DeliveryEvidence>,
 }
 
 impl AcceptanceResult {
@@ -439,52 +517,6 @@ fn capture_downstream(handler: impl FnOnce(&mut TcpStream)) -> Vec<u8> {
     handler(&mut stream);
     drop(stream);
     reader.join().expect("join downstream reader")
-}
-
-fn capture_downstream_until(
-    pattern: &'static [u8],
-) -> impl FnOnce(Box<dyn FnOnce(&mut TcpStream) + Send>) -> Vec<u8> {
-    move |handler| {
-        let listener = bind_loopback();
-        let address = listener.local_addr().expect("read downstream address");
-        let reader = thread::spawn(move || {
-            let mut stream = TcpStream::connect(address).expect("connect downstream reader");
-            let mut response = Vec::new();
-            let mut buffer = [0_u8; 64];
-            loop {
-                let read = stream.read(&mut buffer).expect("read downstream response");
-                if read == 0 {
-                    break;
-                }
-                response.extend_from_slice(&buffer[..read]);
-                if response
-                    .windows(pattern.len())
-                    .any(|candidate| candidate == pattern)
-                {
-                    let linger = libc::linger {
-                        l_onoff: 1,
-                        l_linger: 0,
-                    };
-                    let _ = unsafe {
-                        libc::setsockopt(
-                            stream.as_raw_fd(),
-                            libc::SOL_SOCKET,
-                            libc::SO_LINGER,
-                            &linger as *const libc::linger as *const libc::c_void,
-                            std::mem::size_of_val(&linger) as libc::socklen_t,
-                        )
-                    };
-                    let _ = stream.shutdown(Shutdown::Both);
-                    break;
-                }
-            }
-            response
-        });
-        let (mut stream, _) = listener.accept().expect("accept downstream");
-        handler(&mut stream);
-        drop(stream);
-        reader.join().expect("join downstream reader")
-    }
 }
 
 fn fingerprint_text(digest: &mut Sha256, value: &str) {
@@ -660,7 +692,24 @@ fn run_with_downstream(
         script: upstream.finish(),
         delays_ms: recording.delays_ms,
         diagnostics: recording.diagnostics,
+        delivery_evidence: recording.delivery_evidence,
     }
+}
+
+fn run_with_openai_chat_delivery_failure(
+    route: FixtureRoute,
+    mode: AttemptMode,
+    steps: Vec<UpstreamStep>,
+    failure: DeliveryFailure,
+) -> AcceptanceResult {
+    OPENAI_CHAT_DELIVERY_FAILURE.with(|slot| {
+        *slot.borrow_mut() = Some(failure);
+    });
+    let result = run(route, mode, steps);
+    OPENAI_CHAT_DELIVERY_FAILURE.with(|slot| {
+        *slot.borrow_mut() = None;
+    });
+    result
 }
 
 fn request_id_sentinel(route: FixtureRoute) -> &'static str {
@@ -913,18 +962,30 @@ fn assert_success_fixture(route: FixtureRoute, mode: AttemptMode, fixture_name: 
 }
 
 fn assert_delivery_failure(route: FixtureRoute, mode: AttemptMode, failure: DeliveryFailure) {
-    let close_after: &'static [u8] = match failure {
-        DeliveryFailure::ChunkWrite => b"content-type: text/event-stream",
-        DeliveryFailure::FinalFlush => b"event: ping",
-    };
-    let result = run_with_downstream(
+    let result = run_with_openai_chat_delivery_failure(
         route,
         mode,
         vec![success_step(route, mode)],
-        capture_downstream_until(close_after),
+        failure,
     );
     assert_script(route, &result, 1);
     assert!(result.delays_ms.is_empty());
+    let evidence = result
+        .delivery_evidence
+        .as_ref()
+        .expect("delivery failure fixture must record exact delivery evidence");
+    match failure {
+        DeliveryFailure::ChunkWrite => {
+            assert!(evidence.chunk_write_error);
+            assert!(!evidence.terminal_write_seen);
+            assert!(!evidence.final_flush_error);
+        }
+        DeliveryFailure::FinalFlush => {
+            assert!(!evidence.chunk_write_error);
+            assert!(evidence.terminal_write_seen);
+            assert!(evidence.final_flush_error);
+        }
+    }
     assert_one_final_diagnostic(&result, "cancelled");
 }
 

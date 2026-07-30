@@ -98,6 +98,56 @@ fn permanent_failure_preserves_legacy_shape_and_omits_unknown_optionals() {
 }
 
 #[test]
+fn redirect_projection_is_scoped_to_openai_chat() {
+    let redirect = FailureObservation::Http {
+        status: 307,
+        rate_kind: None,
+        retry_after_seconds: None,
+        request_id: None,
+        error_code: ErrorCode::Absent,
+        error_param: ErrorParam::Absent,
+    };
+
+    let anthropic_failure = ProviderFailure::from_observation(
+        &api_context(
+            ProviderId::Relay,
+            RouteMode::AnthropicMessages,
+            RetryPolicy::ANTHROPIC_MESSAGES,
+        ),
+        &redirect,
+        false,
+    );
+    assert_eq!(anthropic_failure.status(), 502);
+    assert_eq!(
+        anthropic_failure.anthropic_json()["error"]["route"],
+        "anthropic_messages"
+    );
+    assert_eq!(
+        anthropic_failure.anthropic_json()["error"]["upstream_status"],
+        307
+    );
+
+    let openai_chat_failure = ProviderFailure::from_observation(
+        &api_context(
+            ProviderId::OpenaiCustom,
+            RouteMode::OpenaiChat,
+            RetryPolicy::OPENAI_CHAT,
+        ),
+        &redirect,
+        false,
+    );
+    assert_eq!(openai_chat_failure.status(), 307);
+    assert_eq!(
+        openai_chat_failure.anthropic_json()["error"]["route"],
+        "openai_chat"
+    );
+    assert_eq!(
+        openai_chat_failure.anthropic_json()["error"]["upstream_status"],
+        307
+    );
+}
+
+#[test]
 fn transient_failure_projects_only_valid_optional_metadata() {
     let failure = ProviderFailure::from_observation(
         &context(RouteMode::ResponsesLite),

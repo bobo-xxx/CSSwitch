@@ -105,3 +105,94 @@ Results:
 
 - The task brief listed only `server.rs` and `api_key_acceptance.rs`, but the requested redirect assertion (`307` terminal) required a small shared mapper update in `provider_failure.rs`; existing provider-failure tests still pass.
 - The final-flush delivery fixture uses an early RST close at replay `ping` for deterministic cancellation on loopback, because closing after `message_stop` can be fully buffered before the handler observes the close.
+
+## Review fix follow-up
+
+Commit subject: `fix: scope OpenAI Chat review regressions`
+
+### RED evidence
+
+Redirect domain RED:
+
+```bash
+cargo test --offline --manifest-path desktop/gateway/Cargo.toml \
+  provider_failure::tests::redirect_projection_is_scoped_to_openai_chat -- --test-threads=1
+```
+
+Result before fix: failed, 0 passed / 1 failed. Evidence: Anthropic `RouteMode::AnthropicMessages` 307 returned caller status `307`; expected preserved pre-Task5 shared behavior was `502` with `upstream_status:307`.
+
+Final-flush RED:
+
+```bash
+cargo test --offline --manifest-path desktop/gateway/Cargo.toml \
+  --features acceptance-build \
+  'server::api_key_acceptance::api_contract_openai_chat_stream_replay_delivery_controls_final_outcome' \
+  -- --nocapture --test-threads=1
+```
+
+Result before fix: failed, 0 passed / 1 failed. Evidence: the delivery fixture emitted cancellation but recorded no exact delivery evidence, proving the old early-close/ping shortcut did not establish chunk-write vs terminal-final-flush behavior.
+
+### GREEN evidence
+
+Focused GREEN:
+
+```bash
+cargo test --offline --manifest-path desktop/gateway/Cargo.toml \
+  provider_failure::tests::redirect_projection_is_scoped_to_openai_chat -- --test-threads=1
+cargo test --offline --manifest-path desktop/gateway/Cargo.toml \
+  --features acceptance-build \
+  'server::api_key_acceptance::api_contract_openai_chat_stream_replay_delivery_controls_final_outcome' \
+  -- --nocapture --test-threads=1
+```
+
+Results: redirect focused test passed, 1 passed / 0 failed; delivery focused test passed, 1 passed / 0 failed. Delivery diagnostics were: success replay `completed` with `posts:1`; chunk-write failure `cancelled` with `posts:1`; final-flush failure `cancelled` with `posts:1`.
+
+Full required verification:
+
+```bash
+cargo test --offline --manifest-path desktop/gateway/Cargo.toml \
+  --features acceptance-build 'server::api_key_acceptance::api_contract_openai_chat_' \
+  -- --nocapture --test-threads=1
+cargo test --offline --manifest-path desktop/gateway/Cargo.toml provider_failure::tests -- --test-threads=1
+cargo test --offline --manifest-path desktop/gateway/Cargo.toml openai_chat::tests -- --test-threads=1
+cargo test --offline --manifest-path desktop/gateway/Cargo.toml \
+  --features acceptance-build 'server::api_key_acceptance::api_contract_anthropic_' \
+  -- --nocapture --test-threads=1
+cargo test --offline --manifest-path desktop/gateway/Cargo.toml \
+  config::tests::endpoint_join_policies_cover_full_urls_xai_gemini_and_opencode -- --test-threads=1
+cargo fmt --check --manifest-path desktop/gateway/Cargo.toml
+cargo clippy --offline --manifest-path desktop/gateway/Cargo.toml --all-targets -- -D warnings
+git diff --check
+```
+
+Results:
+
+- OpenAI Chat acceptance: 5 passed / 0 failed.
+- `provider_failure::tests`: 18 passed / 0 failed.
+- `openai_chat::tests`: 11 passed / 0 failed.
+- Anthropic API-key acceptance: 6 passed / 0 failed.
+- endpoint join regression: 1 passed / 0 failed.
+- `cargo fmt --check`: passed.
+- clippy: passed warning-free.
+- `git diff --check`: clean.
+
+### Files changed by review fix
+
+- `desktop/gateway/src/provider_failure.rs`
+  - Scoped 3xx caller-status projection to `RouteMode::OpenaiChat`; Anthropic/shared routes now retain generic 502 projection for redirects.
+- `desktop/gateway/src/provider_failure/tests.rs`
+  - Added route-domain redirect regression proving Anthropic 307 stays caller 502 while OpenAI Chat 307 is caller 307.
+- `desktop/gateway/src/server.rs`
+  - Extracted OpenAI Chat downstream delivery into `deliver_openai_chat_response<W: Write>`.
+  - The real handler finalizes completed/cancelled from this delivery result; the acceptance hook only supplies a writer, not an alternate finalizer.
+- `desktop/gateway/src/server/api_key_acceptance.rs`
+  - Replaced early RST/ping final-flush shortcut with a scripted writer.
+  - Chunk-write fixture fails on a replay event write before terminal chunk.
+  - Final-flush fixture accepts all replay chunks and the terminal `0\r\n\r\n` write, then fails specifically on the final flush.
+  - Assertions require exact evidence: chunk error vs terminal write seen vs final flush error.
+
+### Updated self-review
+
+- Redirect behavior is now scoped to OpenAI Chat only; OpenAI Responses is not pre-implemented.
+- FinalFlush evidence now uses the production delivery function and real handler finalizer with a deterministic writer.
+- The previous early-RST/ping concern is resolved and superseded by the scripted final-flush evidence above.

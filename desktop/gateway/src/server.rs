@@ -850,6 +850,27 @@ fn handle_api_key_nonstream(
     finalize_api_key_controller(&mut controller, outcome);
 }
 
+fn deliver_openai_chat_response<W: Write>(
+    stream: &mut W,
+    anthropic_resp: Value,
+    is_stream: bool,
+) -> std::io::Result<()> {
+    if is_stream {
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n"
+        )?;
+        stream.flush()?;
+        for (event, data) in openai_chat::replay_as_sse_events(&anthropic_resp) {
+            write_chunk(stream, &sse_event(&event, &data))?;
+        }
+        stream.write_all(b"0\r\n\r\n")?;
+        stream.flush()
+    } else {
+        write_json_checked(stream, 200, "OK", anthropic_resp)
+    }
+}
+
 fn handle_openai_chat_api_key(
     stream: &mut TcpStream,
     cfg: &GatewayConfig,
@@ -936,41 +957,22 @@ fn handle_openai_chat_api_key(
             return;
         }
     };
-    if is_stream {
-        if write!(
-            stream,
-            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n"
-        )
-        .and_then(|_| stream.flush())
-        .is_err()
-        {
-            finalize_api_key_controller(&mut controller, ApiKeyFinalOutcome::Cancelled);
-            return;
-        }
-        for (event, data) in openai_chat::replay_as_sse_events(&anthropic_resp) {
-            if write_chunk(stream, &sse_event(&event, &data)).is_err() {
-                finalize_api_key_controller(&mut controller, ApiKeyFinalOutcome::Cancelled);
-                return;
-            }
-        }
-        let outcome = if stream
-            .write_all(b"0\r\n\r\n")
-            .and_then(|_| stream.flush())
-            .is_ok()
-        {
-            ApiKeyFinalOutcome::Completed
-        } else {
-            ApiKeyFinalOutcome::Cancelled
-        };
-        finalize_api_key_controller(&mut controller, outcome);
+    #[cfg(all(test, feature = "acceptance-build"))]
+    let delivery = if let Some(result) =
+        api_key_acceptance::openai_chat_delivery_result(&anthropic_resp, is_stream)
+    {
+        result
     } else {
-        let outcome = if write_json_checked(stream, 200, "OK", anthropic_resp).is_ok() {
-            ApiKeyFinalOutcome::Completed
-        } else {
-            ApiKeyFinalOutcome::Cancelled
-        };
-        finalize_api_key_controller(&mut controller, outcome);
-    }
+        deliver_openai_chat_response(stream, anthropic_resp, is_stream)
+    };
+    #[cfg(not(all(test, feature = "acceptance-build")))]
+    let delivery = deliver_openai_chat_response(stream, anthropic_resp, is_stream);
+    let outcome = if delivery.is_ok() {
+        ApiKeyFinalOutcome::Completed
+    } else {
+        ApiKeyFinalOutcome::Cancelled
+    };
+    finalize_api_key_controller(&mut controller, outcome);
 }
 
 fn log_relay_metadata(metadata: &AnthropicMetadata, is_stream: bool, message_count: usize) {
