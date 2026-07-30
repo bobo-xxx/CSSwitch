@@ -1,7 +1,7 @@
 # Linux Launcher Persistence Hardening Design
 
 Date: 2026-07-30
-Status: proposed
+Status: approved
 Scope: machine-local installed launcher only
 
 ## Context
