@@ -4,6 +4,8 @@ use std::time::Duration;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
+use crate::provider_failure::{ProviderId, RetryPolicy, RouteMode};
+
 const STATIC_PROVIDER_CONTRACTS_JSON: &str =
     include_str!("../../../catalog/provider-contracts.v1.json");
 
@@ -20,6 +22,16 @@ struct TimeoutPolicy {
 struct CachePolicy {
     normal_ttl_seconds: u64,
     stale_ttl_seconds: u64,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InferenceRetryConfig {
+    max_posts: u8,
+    fallback_delays_ms: [u64; 2],
+    retry_after_cap_seconds: u64,
+    retry_statuses: Vec<String>,
+    retry_network_kinds: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -42,6 +54,7 @@ struct ProviderContract {
     api_key_env: Option<String>,
     scratch_policy: String,
     thinking_policy: String,
+    inference_retry: Option<InferenceRetryConfig>,
     #[serde(default)]
     upstream_client_version: Option<String>,
     timeouts: TimeoutPolicy,
@@ -123,6 +136,7 @@ pub struct ProviderRuntimeContract {
     pub normal_ttl_seconds: u64,
     pub stale_ttl_seconds: u64,
     pub upstream_client_version: Option<String>,
+    pub inference_retry: Option<RetryPolicy>,
 }
 
 fn catalog_digest() -> String {
@@ -132,8 +146,52 @@ fn catalog_digest() -> String {
     )
 }
 
-fn parse_catalog() -> Result<ProviderContractCatalog, String> {
-    let catalog: ProviderContractCatalog = serde_json::from_str(STATIC_PROVIDER_CONTRACTS_JSON)
+fn retry_policy(contract: &ProviderContract) -> Result<Option<RetryPolicy>, String> {
+    let Some(config) = &contract.inference_retry else {
+        return if contract.auth_mode == "api_key" {
+            Err("API-key provider contract is missing inference retry policy".into())
+        } else {
+            Ok(None)
+        };
+    };
+    if contract.auth_mode != "api_key" {
+        return Err("non-API-key provider contract has inference retry policy".into());
+    }
+    let route = RouteMode::from_api_key_transport(&contract.transport)
+        .ok_or("API-key provider contract transport is unsupported")?;
+    let (expected_statuses, domain_policy): (&[&str], RetryPolicy) = match route {
+        RouteMode::AnthropicMessages => (&["408", "429", "5xx"], RetryPolicy::ANTHROPIC_MESSAGES),
+        RouteMode::OpenaiChat => (&["408", "409", "429", "5xx"], RetryPolicy::OPENAI_CHAT),
+        RouteMode::OpenaiResponses => {
+            (&["408", "409", "429", "5xx"], RetryPolicy::OPENAI_RESPONSES)
+        }
+        RouteMode::Responses | RouteMode::ResponsesLite => {
+            unreachable!("API-key transport conversion excludes Codex routes")
+        }
+    };
+    let exact_statuses = config
+        .retry_statuses
+        .iter()
+        .map(String::as_str)
+        .eq(expected_statuses.iter().copied());
+    let exact_network_kinds = config
+        .retry_network_kinds
+        .iter()
+        .map(String::as_str)
+        .eq(["connect", "timeout"]);
+    if config.max_posts != 3
+        || config.fallback_delays_ms != [500, 1_000]
+        || config.retry_after_cap_seconds != 60
+        || !exact_statuses
+        || !exact_network_kinds
+    {
+        return Err("provider contract inference retry policy is invalid".into());
+    }
+    Ok(Some(domain_policy))
+}
+
+fn parse_catalog_text(input: &str) -> Result<ProviderContractCatalog, String> {
+    let catalog: ProviderContractCatalog = serde_json::from_str(input)
         .map_err(|error| format!("provider contract catalog parse failed: {error}"))?;
     if catalog.schema_version != 1 || catalog.contracts.is_empty() {
         return Err("provider contract catalog schema is unsupported".into());
@@ -150,8 +208,11 @@ fn parse_catalog() -> Result<ProviderContractCatalog, String> {
         {
             return Err("provider contract catalog contains invalid runtime bounds".into());
         }
+        ProviderId::from_adapter(&contract.adapter)
+            .ok_or("provider contract adapter is unsupported")?;
         EndpointJoin::parse(&contract.endpoint_join)?;
         AuthScheme::parse(&contract.auth_scheme)?;
+        retry_policy(contract)?;
         if contract.template_ids.is_empty()
             || contract.api_formats.is_empty()
             || contract.credential_sources.is_empty()
@@ -173,6 +234,10 @@ fn parse_catalog() -> Result<ProviderContractCatalog, String> {
         }
     }
     Ok(catalog)
+}
+
+fn parse_catalog() -> Result<ProviderContractCatalog, String> {
+    parse_catalog_text(STATIC_PROVIDER_CONTRACTS_JSON)
 }
 
 pub(crate) fn load_runtime_contract(
@@ -234,6 +299,7 @@ pub(crate) fn load_runtime_contract(
         normal_ttl_seconds: contract.cache.normal_ttl_seconds,
         stale_ttl_seconds: contract.cache.stale_ttl_seconds,
         upstream_client_version: contract.upstream_client_version.clone(),
+        inference_retry: retry_policy(contract)?,
     })
 }
 
@@ -248,6 +314,7 @@ pub(crate) fn codex_contract_from_runtime(
         || runtime.endpoint_join != EndpointJoin::ManagedOfficial
         || runtime.api_key_env.is_some()
         || runtime.upstream_client_version.as_deref() != Some("0.144.4")
+        || runtime.inference_retry.is_some()
     {
         return Err("Codex provider contract is invalid".into());
     }
@@ -332,6 +399,90 @@ pub(crate) fn validate_managed_identity(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+
+    fn mutated_catalog_text(mutator: impl FnOnce(&mut Vec<serde_json::Value>)) -> String {
+        let mut root: serde_json::Value =
+            serde_json::from_str(STATIC_PROVIDER_CONTRACTS_JSON).unwrap();
+        let contracts = root["contracts"].as_array_mut().unwrap();
+        mutator(contracts);
+        serde_json::to_string(&root).unwrap()
+    }
+
+    #[test]
+    fn every_api_key_contract_has_the_exact_closed_retry_policy() {
+        let catalog = parse_catalog().unwrap();
+        for contract in catalog
+            .contracts
+            .iter()
+            .filter(|contract| contract.auth_mode == "api_key")
+        {
+            let policy = contract
+                .inference_retry
+                .as_ref()
+                .expect("API-key retry policy");
+            assert_eq!(policy.max_posts, 3, "{}", contract.id);
+            assert_eq!(policy.fallback_delays_ms, [500, 1_000], "{}", contract.id);
+            assert_eq!(policy.retry_after_cap_seconds, 60, "{}", contract.id);
+            assert_eq!(
+                policy.retry_network_kinds,
+                ["connect", "timeout"],
+                "{}",
+                contract.id
+            );
+            let expected = match contract.transport.as_str() {
+                "anthropic_messages" => vec!["408", "429", "5xx"],
+                "openai_chat" | "openai_responses" => vec!["408", "409", "429", "5xx"],
+                other => panic!("unexpected API-key transport {other}"),
+            };
+            assert_eq!(policy.retry_statuses, expected, "{}", contract.id);
+        }
+    }
+
+    #[test]
+    fn retry_policy_tokens_reject_duplicates_unknowns_and_codex_attachment() {
+        let duplicate = mutated_catalog_text(|contracts| {
+            let contract = contracts
+                .iter_mut()
+                .find(|contract| contract["auth_mode"] == "api_key")
+                .unwrap();
+            contract["inference_retry"]["retry_statuses"] = json!(["429", "429"]);
+        });
+        assert!(parse_catalog_text(&duplicate).is_err());
+
+        let unknown_status = mutated_catalog_text(|contracts| {
+            let contract = contracts
+                .iter_mut()
+                .find(|contract| contract["auth_mode"] == "api_key")
+                .unwrap();
+            contract["inference_retry"]["retry_statuses"] = json!(["425"]);
+        });
+        assert!(parse_catalog_text(&unknown_status).is_err());
+
+        let unknown_network = mutated_catalog_text(|contracts| {
+            let contract = contracts
+                .iter_mut()
+                .find(|contract| contract["auth_mode"] == "api_key")
+                .unwrap();
+            contract["inference_retry"]["retry_network_kinds"] = json!(["read"]);
+        });
+        assert!(parse_catalog_text(&unknown_network).is_err());
+
+        let codex_attachment = mutated_catalog_text(|contracts| {
+            let codex = contracts
+                .iter_mut()
+                .find(|contract| contract["adapter"] == "codex")
+                .unwrap();
+            codex["inference_retry"] = json!({
+                "max_posts": 3,
+                "fallback_delays_ms": [500, 1000],
+                "retry_after_cap_seconds": 60,
+                "retry_statuses": ["408", "409", "429", "5xx"],
+                "retry_network_kinds": ["connect", "timeout"]
+            });
+        });
+        assert!(parse_catalog_text(&codex_attachment).is_err());
+    }
 
     #[test]
     fn static_codex_contract_drives_gateway_runtime_values() {

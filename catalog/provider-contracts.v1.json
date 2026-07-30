@@ -19,6 +19,13 @@
       "api_key_env": "DEEPSEEK_API_KEY",
       "scratch_policy": "upstream_probe",
       "thinking_policy": "",
+      "inference_retry": {
+        "max_posts": 3,
+        "fallback_delays_ms": [500, 1000],
+        "retry_after_cap_seconds": 60,
+        "retry_statuses": ["408", "429", "5xx"],
+        "retry_network_kinds": ["connect", "timeout"]
+      },
       "timeouts": { "connect_ms": 10000, "total_ms": 30000, "read_idle_ms": 300000 },
       "cache": { "normal_ttl_seconds": 0, "stale_ttl_seconds": 0 }
     },
@@ -40,6 +47,13 @@
       "api_key_env": "DASHSCOPE_API_KEY",
       "scratch_policy": "upstream_probe",
       "thinking_policy": "",
+      "inference_retry": {
+        "max_posts": 3,
+        "fallback_delays_ms": [500, 1000],
+        "retry_after_cap_seconds": 60,
+        "retry_statuses": ["408", "409", "429", "5xx"],
+        "retry_network_kinds": ["connect", "timeout"]
+      },
       "timeouts": { "connect_ms": 10000, "total_ms": 30000, "read_idle_ms": 300000 },
       "cache": { "normal_ttl_seconds": 0, "stale_ttl_seconds": 0 }
     },
@@ -61,6 +75,13 @@
       "api_key_env": "CSSWITCH_RELAY_KEY",
       "scratch_policy": "upstream_probe",
       "thinking_policy": "adaptive",
+      "inference_retry": {
+        "max_posts": 3,
+        "fallback_delays_ms": [500, 1000],
+        "retry_after_cap_seconds": 60,
+        "retry_statuses": ["408", "429", "5xx"],
+        "retry_network_kinds": ["connect", "timeout"]
+      },
       "timeouts": { "connect_ms": 10000, "total_ms": 30000, "read_idle_ms": 300000 },
       "cache": { "normal_ttl_seconds": 0, "stale_ttl_seconds": 0 }
     },
@@ -82,6 +103,13 @@
       "api_key_env": "CSSWITCH_RELAY_KEY",
       "scratch_policy": "upstream_probe",
       "thinking_policy": "enabled",
+      "inference_retry": {
+        "max_posts": 3,
+        "fallback_delays_ms": [500, 1000],
+        "retry_after_cap_seconds": 60,
+        "retry_statuses": ["408", "429", "5xx"],
+        "retry_network_kinds": ["connect", "timeout"]
+      },
       "timeouts": { "connect_ms": 10000, "total_ms": 30000, "read_idle_ms": 300000 },
       "cache": { "normal_ttl_seconds": 0, "stale_ttl_seconds": 0 }
     },
@@ -103,6 +131,13 @@
       "api_key_env": "CSSWITCH_RELAY_KEY",
       "scratch_policy": "upstream_probe",
       "thinking_policy": "adaptive",
+      "inference_retry": {
+        "max_posts": 3,
+        "fallback_delays_ms": [500, 1000],
+        "retry_after_cap_seconds": 60,
+        "retry_statuses": ["408", "429", "5xx"],
+        "retry_network_kinds": ["connect", "timeout"]
+      },
       "timeouts": { "connect_ms": 10000, "total_ms": 30000, "read_idle_ms": 300000 },
       "cache": { "normal_ttl_seconds": 0, "stale_ttl_seconds": 0 }
     },
@@ -124,6 +159,13 @@
       "api_key_env": "CSSWITCH_OPENAI_KEY",
       "scratch_policy": "upstream_probe",
       "thinking_policy": "",
+      "inference_retry": {
+        "max_posts": 3,
+        "fallback_delays_ms": [500, 1000],
+        "retry_after_cap_seconds": 60,
+        "retry_statuses": ["408", "409", "429", "5xx"],
+        "retry_network_kinds": ["connect", "timeout"]
+      },
       "timeouts": { "connect_ms": 10000, "total_ms": 30000, "read_idle_ms": 300000 },
       "cache": { "normal_ttl_seconds": 0, "stale_ttl_seconds": 0 }
     },
@@ -145,6 +187,13 @@
       "api_key_env": "CSSWITCH_OPENAI_KEY",
       "scratch_policy": "upstream_probe",
       "thinking_policy": "",
+      "inference_retry": {
+        "max_posts": 3,
+        "fallback_delays_ms": [500, 1000],
+        "retry_after_cap_seconds": 60,
+        "retry_statuses": ["408", "409", "429", "5xx"],
+        "retry_network_kinds": ["connect", "timeout"]
+      },
       "timeouts": { "connect_ms": 10000, "total_ms": 30000, "read_idle_ms": 300000 },
       "cache": { "normal_ttl_seconds": 0, "stale_ttl_seconds": 0 }
     },
@@ -166,6 +215,13 @@
       "api_key_env": "CSSWITCH_OPENAI_KEY",
       "scratch_policy": "upstream_probe",
       "thinking_policy": "",
+      "inference_retry": {
+        "max_posts": 3,
+        "fallback_delays_ms": [500, 1000],
+        "retry_after_cap_seconds": 60,
+        "retry_statuses": ["408", "409", "429", "5xx"],
+        "retry_network_kinds": ["connect", "timeout"]
+      },
       "timeouts": { "connect_ms": 10000, "total_ms": 30000, "read_idle_ms": 300000 },
       "cache": { "normal_ttl_seconds": 0, "stale_ttl_seconds": 0 }
     },
@@ -187,6 +243,13 @@
       "api_key_env": "CSSWITCH_RELAY_KEY",
       "scratch_policy": "upstream_probe",
       "thinking_policy": "",
+      "inference_retry": {
+        "max_posts": 3,
+        "fallback_delays_ms": [500, 1000],
+        "retry_after_cap_seconds": 60,
+        "retry_statuses": ["408", "429", "5xx"],
+        "retry_network_kinds": ["connect", "timeout"]
+      },
       "timeouts": { "connect_ms": 10000, "total_ms": 30000, "read_idle_ms": 300000 },
       "cache": { "normal_ttl_seconds": 0, "stale_ttl_seconds": 0 }
     },
@@ -208,6 +271,13 @@
       "api_key_env": "CSSWITCH_OPENAI_KEY",
       "scratch_policy": "upstream_probe",
       "thinking_policy": "",
+      "inference_retry": {
+        "max_posts": 3,
+        "fallback_delays_ms": [500, 1000],
+        "retry_after_cap_seconds": 60,
+        "retry_statuses": ["408", "409", "429", "5xx"],
+        "retry_network_kinds": ["connect", "timeout"]
+      },
       "timeouts": { "connect_ms": 10000, "total_ms": 30000, "read_idle_ms": 300000 },
       "cache": { "normal_ttl_seconds": 0, "stale_ttl_seconds": 0 }
     },
@@ -229,6 +299,13 @@
       "api_key_env": "CSSWITCH_OPENAI_KEY",
       "scratch_policy": "upstream_probe",
       "thinking_policy": "",
+      "inference_retry": {
+        "max_posts": 3,
+        "fallback_delays_ms": [500, 1000],
+        "retry_after_cap_seconds": 60,
+        "retry_statuses": ["408", "409", "429", "5xx"],
+        "retry_network_kinds": ["connect", "timeout"]
+      },
       "timeouts": { "connect_ms": 10000, "total_ms": 30000, "read_idle_ms": 300000 },
       "cache": { "normal_ttl_seconds": 0, "stale_ttl_seconds": 0 }
     },

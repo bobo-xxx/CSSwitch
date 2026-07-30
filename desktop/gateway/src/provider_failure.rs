@@ -7,6 +7,25 @@ use serde_json::{json, Value};
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ProviderId {
     Codex,
+    Deepseek,
+    Qwen,
+    Relay,
+    OpenaiCustom,
+    OpenaiResponses,
+}
+
+impl ProviderId {
+    pub(crate) fn from_adapter(adapter: &str) -> Option<Self> {
+        match adapter {
+            "codex" => Some(Self::Codex),
+            "deepseek" => Some(Self::Deepseek),
+            "qwen" => Some(Self::Qwen),
+            "relay" => Some(Self::Relay),
+            "openai-custom" => Some(Self::OpenaiCustom),
+            "openai-responses" => Some(Self::OpenaiResponses),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -14,6 +33,20 @@ pub(crate) enum ProviderId {
 pub(crate) enum RouteMode {
     Responses,
     ResponsesLite,
+    AnthropicMessages,
+    OpenaiChat,
+    OpenaiResponses,
+}
+
+impl RouteMode {
+    pub(crate) fn from_api_key_transport(transport: &str) -> Option<Self> {
+        match transport {
+            "anthropic_messages" => Some(Self::AnthropicMessages),
+            "openai_chat" => Some(Self::OpenaiChat),
+            "openai_responses" => Some(Self::OpenaiResponses),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -54,6 +87,13 @@ pub(crate) struct RetryPolicy {
     pub(crate) max_posts: u8,
     pub(crate) fallback_delays_ms: [u64; 2],
     pub(crate) retry_after_cap_seconds: u64,
+    retry_408: bool,
+    retry_409: bool,
+    retry_429: bool,
+    retry_5xx: bool,
+    retry_connect: bool,
+    retry_timeout: bool,
+    retry_unknown_429: bool,
 }
 
 impl RetryPolicy {
@@ -61,7 +101,63 @@ impl RetryPolicy {
         max_posts: 3,
         fallback_delays_ms: [500, 1_000],
         retry_after_cap_seconds: 60,
+        retry_408: true,
+        retry_409: true,
+        retry_429: true,
+        retry_5xx: true,
+        retry_connect: true,
+        retry_timeout: true,
+        retry_unknown_429: false,
     };
+
+    pub(crate) const ANTHROPIC_MESSAGES: Self = Self {
+        max_posts: 3,
+        fallback_delays_ms: [500, 1_000],
+        retry_after_cap_seconds: 60,
+        retry_408: true,
+        retry_409: false,
+        retry_429: true,
+        retry_5xx: true,
+        retry_connect: true,
+        retry_timeout: true,
+        retry_unknown_429: true,
+    };
+
+    pub(crate) const OPENAI_CHAT: Self = Self {
+        max_posts: 3,
+        fallback_delays_ms: [500, 1_000],
+        retry_after_cap_seconds: 60,
+        retry_408: true,
+        retry_409: true,
+        retry_429: true,
+        retry_5xx: true,
+        retry_connect: true,
+        retry_timeout: true,
+        retry_unknown_429: true,
+    };
+
+    pub(crate) const OPENAI_RESPONSES: Self = Self::OPENAI_CHAT;
+
+    pub(crate) fn allows(&self, observation: &FailureObservation) -> bool {
+        match observation {
+            FailureObservation::Http { status: 408, .. } => self.retry_408,
+            FailureObservation::Http { status: 409, .. } => self.retry_409,
+            FailureObservation::Http {
+                status: 429,
+                rate_kind,
+                ..
+            } => self.retry_429 && (rate_kind.is_some() || self.retry_unknown_429),
+            FailureObservation::Http {
+                status: 500..=599, ..
+            } => self.retry_5xx,
+            FailureObservation::Network(NetworkKind::Connect) => self.retry_connect,
+            FailureObservation::Network(NetworkKind::Timeout) => self.retry_timeout,
+            FailureObservation::Network(NetworkKind::Read) => *self == Self::CODEX,
+            FailureObservation::Http { .. }
+            | FailureObservation::Protocol(_)
+            | FailureObservation::Cancelled => false,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -79,6 +175,34 @@ impl RouteContext {
             route,
             correlation_id,
             retry_policy: RetryPolicy::CODEX,
+        }
+    }
+
+    // Introduced at the Task 1 interface boundary; production handlers consume it in later tasks.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn api_key(
+        provider: ProviderId,
+        route: RouteMode,
+        correlation_id: CorrelationId,
+        retry_policy: RetryPolicy,
+    ) -> Self {
+        assert!(
+            provider != ProviderId::Codex,
+            "API-key provider must be non-Codex"
+        );
+        assert!(
+            !matches!(route, RouteMode::Responses | RouteMode::ResponsesLite),
+            "API-key route must be non-Codex"
+        );
+        assert!(
+            retry_policy != RetryPolicy::CODEX,
+            "API-key retry policy must be non-Codex"
+        );
+        Self {
+            provider,
+            route,
+            correlation_id,
+            retry_policy,
         }
     }
 }
@@ -266,7 +390,7 @@ impl ProviderFailure {
                 "rate_limit_error",
                 "Provider rate limit prevents this request",
                 FailureClass::RateLimit,
-                false,
+                exhausted,
                 "Wait for rate capacity before starting a new request",
             ),
             FailureObservation::Http { status: 408, .. } => (
@@ -636,25 +760,18 @@ impl AttemptController {
             ));
         }
 
-        let proven_rate = matches!(
+        let quota = matches!(
             &observation,
             FailureObservation::Http {
                 status: 429,
-                rate_kind: Some(RateKind::RateLimit),
+                rate_kind: Some(RateKind::Quota),
                 ..
             }
         );
-        let transient_http = matches!(
-            &observation,
-            FailureObservation::Http {
-                status: 408 | 409 | 500..=599,
-                ..
-            }
-        );
-        let transient_network = matches!(&observation, FailureObservation::Network(_));
-        let can_retry = self.repairs == 0
-            && self.posts < self.context.retry_policy.max_posts
-            && (proven_rate || transient_http || transient_network);
+        let policy_allows = self.context.retry_policy.allows(&observation);
+        let retryable = !quota && policy_allows;
+        let can_retry =
+            self.repairs == 0 && self.posts < self.context.retry_policy.max_posts && retryable;
         if can_retry {
             let override_seconds = match &observation {
                 FailureObservation::Http {
@@ -675,7 +792,7 @@ impl AttemptController {
             return Ok(AttemptDirective::RetryAfter(delay_ms));
         }
 
-        let exhausted = proven_rate || transient_http || transient_network;
+        let exhausted = retryable;
         self.phase = AttemptPhase::TerminalPending(AttemptOutcome::Failed);
         Ok(AttemptDirective::Fail(ProviderFailure::from_observation(
             &self.context,
