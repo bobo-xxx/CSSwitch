@@ -2,7 +2,7 @@
 
 Date: 2026-07-30
 
-Status: approved in conversation; written-spec review pending
+Status: approved in conversation and written-spec review
 
 ## Purpose
 
