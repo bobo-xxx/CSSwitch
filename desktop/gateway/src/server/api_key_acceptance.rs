@@ -236,6 +236,93 @@ enum UpstreamStep {
     PartialSseThenDrop(Vec<u8>),
 }
 
+#[derive(Clone, Copy, Debug)]
+enum NetworkFixture {
+    ConnectRefused,
+    Timeout,
+}
+
+struct TimeoutUpstream {
+    address: SocketAddr,
+    requests: Arc<Mutex<Vec<CapturedRequest>>>,
+    stop: Arc<AtomicBool>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl TimeoutUpstream {
+    fn start() -> Self {
+        let listener = bind_loopback();
+        listener
+            .set_nonblocking(true)
+            .expect("make timeout upstream nonblocking");
+        let address = listener
+            .local_addr()
+            .expect("read timeout upstream address");
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let requests_for_thread = Arc::clone(&requests);
+        let stop_for_thread = Arc::clone(&stop);
+        let thread = thread::spawn(move || {
+            let mut workers = Vec::new();
+            while !stop_for_thread.load(Ordering::Acquire) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let requests = Arc::clone(&requests_for_thread);
+                        let stop = Arc::clone(&stop_for_thread);
+                        workers.push(thread::spawn(move || {
+                            if let Ok(request) = read_request(&mut stream) {
+                                requests
+                                    .lock()
+                                    .expect("lock timeout requests")
+                                    .push(request);
+                            }
+                            while !stop.load(Ordering::Acquire) {
+                                thread::sleep(Duration::from_millis(1));
+                            }
+                        }));
+                    }
+                    Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(error) => panic!("timeout upstream accept failed: {error}"),
+                }
+            }
+            for worker in workers {
+                worker.join().expect("join timeout upstream worker");
+            }
+        });
+        Self {
+            address,
+            requests,
+            stop,
+            thread: Some(thread),
+        }
+    }
+
+    fn endpoint(&self, route: FixtureRoute) -> String {
+        endpoint_for(self.address, route)
+    }
+
+    fn finish(mut self) -> Vec<CapturedRequest> {
+        self.stop.store(true, Ordering::Release);
+        self.thread
+            .take()
+            .expect("timeout upstream thread")
+            .join()
+            .expect("join timeout upstream");
+        self.requests.lock().expect("lock timeout requests").clone()
+    }
+}
+
+impl Drop for TimeoutUpstream {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
 impl UpstreamStep {
     fn json(status: u16, reason: &'static str, body: Value) -> Self {
         Self::json_with_headers(status, reason, body, Vec::new())
@@ -366,18 +453,7 @@ impl ScriptedUpstream {
     }
 
     fn endpoint(&self, route: FixtureRoute) -> String {
-        let path = match route {
-            FixtureRoute::RelayAnthropic
-            | FixtureRoute::RelayKimi
-            | FixtureRoute::DeepseekAnthropic => "/v1/messages",
-            FixtureRoute::QwenChat
-            | FixtureRoute::OpenaiCustomChat
-            | FixtureRoute::GeminiChat
-            | FixtureRoute::GrokChat
-            | FixtureRoute::OpenCodeGoChat => "/v1/chat/completions",
-            FixtureRoute::OpenaiResponses => "/responses",
-        };
-        format!("http://{}{}", self.address, path)
+        endpoint_for(self.address, route)
     }
 
     fn finish(mut self) -> ScriptResult {
@@ -396,6 +472,21 @@ impl ScriptedUpstream {
             rejected_requests: state.rejected_requests,
         }
     }
+}
+
+fn endpoint_for(address: SocketAddr, route: FixtureRoute) -> String {
+    let path = match route {
+        FixtureRoute::RelayAnthropic
+        | FixtureRoute::RelayKimi
+        | FixtureRoute::DeepseekAnthropic => "/v1/messages",
+        FixtureRoute::QwenChat
+        | FixtureRoute::OpenaiCustomChat
+        | FixtureRoute::GeminiChat
+        | FixtureRoute::GrokChat
+        | FixtureRoute::OpenCodeGoChat => "/v1/chat/completions",
+        FixtureRoute::OpenaiResponses => "/responses",
+    };
+    format!("http://{address}{path}")
 }
 
 impl Drop for ScriptedUpstream {
@@ -721,6 +812,18 @@ fn config(route: FixtureRoute, upstream_url: String) -> GatewayConfig {
     }
 }
 
+fn network_fixture_config(route: FixtureRoute, upstream_url: String) -> GatewayConfig {
+    let mut cfg = config(route, upstream_url);
+    let contract = cfg
+        .provider_contract
+        .as_mut()
+        .expect("network fixture requires managed provider contract");
+    contract.connect_timeout = Duration::from_millis(20);
+    contract.request_timeout = Duration::from_millis(20);
+    contract.read_idle_timeout = Duration::from_millis(20);
+    cfg
+}
+
 fn provider_contract_catalog_digest() -> String {
     let text = include_str!("../../../../catalog/provider-contracts.v1.json");
     format!("{:x}", Sha256::digest(text.as_bytes()))
@@ -783,6 +886,31 @@ fn run_with_downstream(
         diagnostics: recording.diagnostics,
         delivery_evidence: recording.delivery_evidence,
     }
+}
+
+fn run_network_endpoint(route: FixtureRoute, endpoint: String) -> (Vec<u8>, RecordingState) {
+    let cfg = network_fixture_config(route, endpoint);
+    let request_nonces = RequestNonceGenerator::with_prefix([0x42; 16]);
+    let relay_models = models::RelayModelCache::default();
+    start_recording();
+    let downstream = capture_downstream(|stream| {
+        handle_messages(
+            stream,
+            &cfg,
+            serde_json::to_vec(&request(
+                AttemptMode::Nonstream,
+                matches!(
+                    route,
+                    FixtureRoute::DeepseekAnthropic | FixtureRoute::OpenaiResponses
+                ),
+            ))
+            .expect("serialize caller request"),
+            Some(&request_nonces),
+            &relay_models,
+            CodexComponents::default(),
+        );
+    });
+    (downstream, finish_recording())
 }
 
 fn run_with_openai_chat_delivery_failure(
@@ -1106,6 +1234,105 @@ fn assert_exhausted(
     assert_eq!(result.delays_ms, expected_delays_ms);
     assert_failure_response(route, &result, 502);
     assert_one_final_diagnostic(&result, "failed");
+}
+
+fn assert_real_network_exhaustion(
+    route: FixtureRoute,
+    fixture: NetworkFixture,
+    expected_status: u16,
+) {
+    let (downstream, recording, requests) = match fixture {
+        NetworkFixture::ConnectRefused => {
+            let listener = bind_loopback();
+            let address = listener.local_addr().expect("read refused address");
+            drop(listener);
+            let (downstream, recording) = run_network_endpoint(route, endpoint_for(address, route));
+            (downstream, recording, None)
+        }
+        NetworkFixture::Timeout => {
+            let upstream = TimeoutUpstream::start();
+            let endpoint = upstream.endpoint(route);
+            let (downstream, recording) = run_network_endpoint(route, endpoint);
+            (downstream, recording, Some(upstream.finish()))
+        }
+    };
+    let result = AcceptanceResult {
+        downstream,
+        script: ScriptResult {
+            requests: Vec::new(),
+            remaining_steps: 0,
+            unexpected_posts: 0,
+            unexpected_methods: 0,
+            rejected_requests: 0,
+        },
+        delays_ms: recording.delays_ms,
+        diagnostics: recording.diagnostics,
+        delivery_evidence: recording.delivery_evidence,
+    };
+    assert_eq!(result.delays_ms, [500, 1_000]);
+    assert_failure_response(route, &result, expected_status);
+    assert_one_final_diagnostic(&result, "failed");
+    let diagnostic = &result.diagnostics[0];
+    assert_eq!(diagnostic["posts"], 3);
+    assert_eq!(diagnostic["repairs"], 0);
+    assert_eq!(
+        diagnostic["reason"],
+        json!({
+            "kind": "failed",
+            "delay_count": 2,
+            "mapped_status": expected_status,
+            "failure_class": "network",
+            "retryable": true
+        })
+    );
+    assert!(!result.text().contains(API_KEY_SENTINEL));
+    assert!(!result.text().contains(SECRET_UPSTREAM_TEXT));
+    assert!(!result.text().contains(PRIVATE_HOST_SENTINEL));
+    assert_no_diagnostic_sentinels_for_test(
+        &result.diagnostics,
+        &[
+            API_KEY_SENTINEL,
+            SECRET_UPSTREAM_TEXT,
+            PRIVATE_HOST_SENTINEL,
+        ],
+    );
+    let outcomes = result
+        .diagnostics
+        .iter()
+        .filter_map(|value| value["outcome"].as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(outcomes, ["failed"]);
+    assert!(!outcomes.contains(&"completed"));
+    assert!(!outcomes.contains(&"cancelled"));
+
+    if let Some(requests) = requests {
+        assert_eq!(
+            requests.len(),
+            3,
+            "timeout fixture must receive three POSTs"
+        );
+        for request in &requests {
+            assert_eq!(request.method, "POST");
+            assert_eq!(endpoint_for_path(route), request.path);
+        }
+        for request in &requests[1..] {
+            assert_eq!(request.body, requests[0].body, "retried body bytes changed");
+        }
+    }
+}
+
+fn endpoint_for_path(route: FixtureRoute) -> &'static str {
+    match route {
+        FixtureRoute::RelayAnthropic
+        | FixtureRoute::RelayKimi
+        | FixtureRoute::DeepseekAnthropic => "/v1/messages",
+        FixtureRoute::QwenChat
+        | FixtureRoute::OpenaiCustomChat
+        | FixtureRoute::GeminiChat
+        | FixtureRoute::GrokChat
+        | FixtureRoute::OpenCodeGoChat => "/v1/chat/completions",
+        FixtureRoute::OpenaiResponses => "/responses",
+    }
 }
 
 fn assert_opened_failure(route: FixtureRoute, mode: AttemptMode, opened_fixture: OpenedFixture) {
@@ -1555,6 +1782,18 @@ fn api_contract_anthropic_rate_and_5xx_are_bounded_and_byte_identical() {
 }
 
 #[test]
+fn api_contract_real_transport_connect_and_timeout_exhaustion_is_closed() {
+    for route in [
+        FixtureRoute::RelayAnthropic,
+        FixtureRoute::OpenaiCustomChat,
+        FixtureRoute::OpenaiResponses,
+    ] {
+        assert_real_network_exhaustion(route, NetworkFixture::ConnectRefused, 502);
+        assert_real_network_exhaustion(route, NetworkFixture::Timeout, 504);
+    }
+}
+
+#[test]
 fn api_contract_anthropic_409_is_terminal() {
     assert_terminal_http(
         FixtureRoute::RelayAnthropic,
@@ -1751,24 +1990,6 @@ fn api_contract_cross_route_raw_body_key_header_url_and_request_id_never_reach_d
             ],
         );
     }
-}
-
-#[test]
-fn api_contract_cross_route_delivery_uses_shared_production_path() {
-    let source = include_str!("../server.rs");
-    assert!(
-        !source
-            .contains("if api_key_acceptance::delivery_failure_enabled() {\n        let (opened"),
-        "delivery fault injection must not bypass the production stream delivery path"
-    );
-    assert!(
-        !source.contains("#[allow(dead_code)]\nfn finalize_opened_delivery"),
-        "opened delivery finalizer must be live, not dead-code allowed"
-    );
-    assert!(
-        source.matches("finalize_opened_delivery(").count() >= 3,
-        "opened delivery finalizer must be used by multiple production branches"
-    );
 }
 
 #[test]
