@@ -69,6 +69,8 @@ A new trait hierarchy for all transports could unify more code, but would force 
 - `retry_statuses`: an explicit closed list per protocol contract.
 - `retry_network_kinds`: exactly pre-response `connect` and `timeout`.
 
+Both lists use validated string tokens rather than free-form values. `retry_statuses` accepts only `"408"`, `"409"`, `"429"`, and `"5xx"`; `retry_network_kinds` accepts only `"connect"` and `"timeout"`. Each list rejects duplicates. The Anthropic Messages contracts store `["408", "429", "5xx"]`; OpenAI Chat and OpenAI Responses store `["408", "409", "429", "5xx"]`.
+
 Codex retains `RetryPolicy::CODEX`; its contract and behavior do not inherit API-key policy. Missing, duplicated, out-of-range or incompatible API-key policy fields fail provider-contract loading rather than enabling a default retry set.
 
 The policy matrices are:
