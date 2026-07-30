@@ -25,12 +25,11 @@ Ship a general Provider Failure Contract in CSSwitch, proven first through Codex
 - [Decide the provider rollout boundary](issues/04-decide-provider-rollout-boundary.md) — Roll out in two stages: Codex first, then the shared API-key inference adapter with explicit per-route retry policies and fixture-based conformance.
 - [Implement the Codex-first contract slice](issues/05-implement-codex-first-slice.md) — The reviewed and published feature branch resolves the deterministic Codex Provider Failure Contract with 8/8 harness and 27/27 contract tests; installed/live verification remains Ticket 06, and the shared API-key Provider Route adapter remains Ticket 07.
 - [Verify Codex routing on Linux headless](issues/06-verify-codex-linux-headless.md) — The backed-up installed Gateway and tunnel-preserved Science runtime pass deterministic gates, live model discovery, and two minimal Codex subscription inferences through proxy port 2999; the historical upstream fault did not recur, while its bounded terminal behavior remains established by the real-handler contract. Ticket 07 remains the shared API-key Provider Route boundary.
-- [Extend the contract to the selected Provider Routes](issues/07-extend-selected-provider-routes.md) — The reviewed and published shared API-key Provider Failure Contract now covers Anthropic Messages, OpenAI Chat, and OpenAI Responses with explicit route policies, bounded three-POST pre-response retries, closed/redacted errors and diagnostics, and response-open/cancellation barriers; deterministic Linux gates are clean, while live-provider, installed-runtime, and macOS verification remain outside this resolution.
+- [Extend the contract to the selected Provider Routes](issues/07-extend-selected-provider-routes.md) — PR #1 merged the reviewed shared API-key Provider Failure Contract into `ticket06/codex-linux-headless`, covering Anthropic Messages, OpenAI Chat, and OpenAI Responses with explicit route policies, bounded three-POST pre-response retries, closed/redacted errors and diagnostics, response-open/cancellation barriers, and the reviewed oversized-body fail-closed remediation; deterministic Linux gates are clean, while live-provider, installed-runtime, and macOS verification remain outside this resolution.
 
 ## Not yet specified
 
 - Long-context and compaction recovery beyond safe request normalization; the correct boundary depends on the verified failure taxonomy.
-- Upstream publication form and reviewer evidence; the exact handoff depends on repository permissions and the final diff.
 
 ## Out of scope
 
