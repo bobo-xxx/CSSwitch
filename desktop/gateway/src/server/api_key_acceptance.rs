@@ -29,6 +29,7 @@ const MAX_REQUEST_TOTAL_BYTES: usize = MAX_REQUEST_HEADER_BYTES + MAX_REQUEST_BO
 thread_local! {
     static API_KEY_ACCEPTANCE_RECORDING: RefCell<Option<RecordingState>> = const { RefCell::new(None) };
     static OPENAI_CHAT_DELIVERY_FAILURE: RefCell<Option<DeliveryFailure>> = const { RefCell::new(None) };
+    static CANCEL_ON_RECORDED_WAIT: RefCell<bool> = const { RefCell::new(false) };
 }
 
 #[derive(Default)]
@@ -43,6 +44,16 @@ pub(super) fn record_attempt_delay(delay_ms: u64) {
         if let Some(state) = slot.borrow_mut().as_mut() {
             state.delays_ms.push(delay_ms);
         }
+    });
+}
+
+pub(super) fn cancel_recorded_wait() -> bool {
+    CANCEL_ON_RECORDED_WAIT.with(|slot| *slot.borrow())
+}
+
+fn set_cancel_on_recorded_wait(value: bool) {
+    CANCEL_ON_RECORDED_WAIT.with(|slot| {
+        *slot.borrow_mut() = value;
     });
 }
 
@@ -100,21 +111,28 @@ enum OpenedFixture {
 
 #[derive(Clone, Copy, Debug)]
 enum DeliveryFailure {
+    FinalBodyWrite,
     ChunkWrite,
+    TerminalChunkWrite,
     FinalFlush,
 }
 
 #[derive(Clone, Debug, Default)]
 struct DeliveryEvidence {
+    final_body_write_error: bool,
     chunk_write_error: bool,
+    terminal_chunk_write_error: bool,
     terminal_write_seen: bool,
     final_flush_error: bool,
+    response_head_seen: bool,
 }
 
 #[derive(Clone, Debug)]
 struct ScriptedDeliveryWriter {
     failure: DeliveryFailure,
     evidence: DeliveryEvidence,
+    response_head_buffer: Vec<u8>,
+    final_body_pending: bool,
 }
 
 impl ScriptedDeliveryWriter {
@@ -122,12 +140,39 @@ impl ScriptedDeliveryWriter {
         Self {
             failure,
             evidence: DeliveryEvidence::default(),
+            response_head_buffer: Vec::new(),
+            final_body_pending: false,
         }
     }
 }
 
 impl Write for ScriptedDeliveryWriter {
     fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        if matches!(self.failure, DeliveryFailure::FinalBodyWrite) {
+            if self.final_body_pending && !buffer.is_empty() {
+                self.evidence.final_body_write_error = true;
+                return Err(Error::new(
+                    ErrorKind::BrokenPipe,
+                    "scripted final JSON body write failure",
+                ));
+            }
+            self.response_head_buffer.extend_from_slice(buffer);
+            if let Some(head_end) = self
+                .response_head_buffer
+                .windows(4)
+                .position(|candidate| candidate == b"\r\n\r\n")
+            {
+                self.evidence.response_head_seen = true;
+                if self.response_head_buffer.len() > head_end + 4 {
+                    self.evidence.final_body_write_error = true;
+                    return Err(Error::new(
+                        ErrorKind::BrokenPipe,
+                        "scripted final JSON body write failure",
+                    ));
+                }
+                self.final_body_pending = true;
+            }
+        }
         if matches!(self.failure, DeliveryFailure::ChunkWrite)
             && buffer
                 .windows(b"event: content_block_start".len())
@@ -141,6 +186,13 @@ impl Write for ScriptedDeliveryWriter {
         }
         if buffer.windows(5).any(|candidate| candidate == b"0\r\n\r\n") {
             self.evidence.terminal_write_seen = true;
+            if matches!(self.failure, DeliveryFailure::TerminalChunkWrite) {
+                self.evidence.terminal_chunk_write_error = true;
+                return Err(Error::new(
+                    ErrorKind::BrokenPipe,
+                    "scripted terminal chunk write failure",
+                ));
+            }
         }
         Ok(buffer.len())
     }
@@ -158,18 +210,20 @@ impl Write for ScriptedDeliveryWriter {
     }
 }
 
-pub(super) fn openai_chat_delivery_result(
-    anthropic_resp: &Value,
-    is_stream: bool,
+pub(super) fn provider_delivery_result(
+    deliver: impl FnOnce(&mut dyn Write) -> std::io::Result<()>,
 ) -> Option<std::io::Result<()>> {
     let failure = OPENAI_CHAT_DELIVERY_FAILURE.with(|slot| *slot.borrow());
     failure.map(|failure| {
         let mut writer = ScriptedDeliveryWriter::new(failure);
-        let result =
-            super::deliver_openai_chat_response(&mut writer, anthropic_resp.clone(), is_stream);
+        let result = deliver(&mut writer);
         record_delivery_evidence(writer.evidence);
         result
     })
+}
+
+pub(super) fn delivery_failure_enabled() -> bool {
+    OPENAI_CHAT_DELIVERY_FAILURE.with(|slot| slot.borrow().is_some())
 }
 
 #[derive(Clone, Debug)]
@@ -361,6 +415,31 @@ struct AcceptanceResult {
     delays_ms: Vec<u64>,
     diagnostics: Vec<Value>,
     delivery_evidence: Option<DeliveryEvidence>,
+}
+
+struct AcceptanceFixture {
+    upstream: ScriptedUpstream,
+    gateway: TcpListener,
+}
+
+impl AcceptanceFixture {
+    fn new(route: FixtureRoute) -> Self {
+        let upstream = ScriptedUpstream::start(Vec::new());
+        let _endpoint = upstream.endpoint(route);
+        let gateway = bind_loopback();
+        Self { upstream, gateway }
+    }
+
+    fn upstream_port(&self) -> u16 {
+        self.upstream.address.port()
+    }
+
+    fn gateway_port(&self) -> u16 {
+        self.gateway
+            .local_addr()
+            .expect("read gateway fixture address")
+            .port()
+    }
 }
 
 impl AcceptanceResult {
@@ -749,6 +828,7 @@ fn failure_body(route: FixtureRoute, status: u16, error_code: ErrorCode) -> Valu
         "type": "api_error",
         "message": SECRET_UPSTREAM_TEXT,
         "request_id": request_id_sentinel(route),
+        "cross_request_id": "Req-secret-cross-route",
         "host": PRIVATE_HOST_SENTINEL
     });
     if !code.is_empty() {
@@ -849,6 +929,26 @@ fn assert_one_final_diagnostic(result: &AcceptanceResult, expected_outcome: &str
         "exactly one final diagnostic required"
     );
     assert_eq!(result.diagnostics[0]["outcome"], expected_outcome);
+}
+
+fn assert_diagnostic_keys(route: FixtureRoute, expected: &[&str]) {
+    let result = run(
+        route,
+        AttemptMode::Nonstream,
+        vec![success_step(route, AttemptMode::Nonstream)],
+    );
+    assert_script(route, &result, 1);
+    assert_one_final_diagnostic(&result, "completed");
+    let mut actual = result.diagnostics[0]
+        .as_object()
+        .expect("diagnostic object")
+        .keys()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    actual.sort_unstable();
+    let mut expected = expected.to_vec();
+    expected.sort_unstable();
+    assert_eq!(actual, expected);
 }
 
 fn assert_failure_response(route: FixtureRoute, result: &AcceptanceResult, status: u16) {
@@ -1012,17 +1112,86 @@ fn assert_delivery_failure(route: FixtureRoute, mode: AttemptMode, failure: Deli
         .as_ref()
         .expect("delivery failure fixture must record exact delivery evidence");
     match failure {
-        DeliveryFailure::ChunkWrite => {
-            assert!(evidence.chunk_write_error);
+        DeliveryFailure::FinalBodyWrite => {
+            assert!(evidence.final_body_write_error);
+            assert!(!evidence.chunk_write_error);
+            assert!(!evidence.terminal_chunk_write_error);
             assert!(!evidence.terminal_write_seen);
             assert!(!evidence.final_flush_error);
         }
-        DeliveryFailure::FinalFlush => {
+        DeliveryFailure::ChunkWrite => {
+            assert!(!evidence.final_body_write_error);
+            assert!(evidence.chunk_write_error);
+            assert!(!evidence.terminal_chunk_write_error);
+            assert!(!evidence.terminal_write_seen);
+            assert!(!evidence.final_flush_error);
+        }
+        DeliveryFailure::TerminalChunkWrite => {
+            assert!(!evidence.final_body_write_error);
             assert!(!evidence.chunk_write_error);
+            assert!(evidence.terminal_write_seen);
+            assert!(evidence.terminal_chunk_write_error);
+            assert!(!evidence.final_flush_error);
+        }
+        DeliveryFailure::FinalFlush => {
+            assert!(!evidence.final_body_write_error);
+            assert!(!evidence.chunk_write_error);
+            assert!(!evidence.terminal_chunk_write_error);
             assert!(evidence.terminal_write_seen);
             assert!(evidence.final_flush_error);
         }
     }
+    assert_one_final_diagnostic(&result, "cancelled");
+    let outcomes = result
+        .diagnostics
+        .iter()
+        .filter_map(|diagnostic| diagnostic["outcome"].as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(outcomes, vec!["cancelled"]);
+    assert!(!outcomes.contains(&"failed"));
+    assert!(!outcomes.contains(&"completed"));
+}
+
+fn assert_wait_cancellation(
+    route: FixtureRoute,
+    status: u16,
+    expected_posts: usize,
+    expected_delays_ms: &[u64],
+) {
+    set_cancel_on_recorded_wait(true);
+    let result = run_with_downstream(
+        route,
+        AttemptMode::Nonstream,
+        vec![
+            UpstreamStep::json(
+                status,
+                "Retryable",
+                failure_body(route, status, ErrorCode::RateLimitError),
+            ),
+            success_step(route, AttemptMode::Nonstream),
+        ],
+        |handler| {
+            let listener = bind_loopback();
+            let address = listener.local_addr().expect("read downstream address");
+            let reader = thread::spawn(move || {
+                let stream = TcpStream::connect(address).expect("connect downstream reader");
+                thread::sleep(Duration::from_millis(25));
+                drop(stream);
+                Vec::new()
+            });
+            let (mut stream, _) = listener.accept().expect("accept downstream");
+            handler(&mut stream);
+            drop(stream);
+            reader.join().expect("join downstream reader")
+        },
+    );
+    set_cancel_on_recorded_wait(false);
+    assert_eq!(result.script.requests.len(), expected_posts);
+    assert_eq!(result.script.remaining_steps, 1);
+    assert_eq!(result.script.unexpected_posts, 0);
+    assert_eq!(result.script.unexpected_methods, 0);
+    assert_eq!(result.script.rejected_requests, 0);
+    assert_eq!(result.delays_ms, expected_delays_ms);
     assert_one_final_diagnostic(&result, "cancelled");
 }
 
@@ -1470,8 +1639,91 @@ fn api_contract_openai_chat_stream_replay_delivery_controls_final_outcome() {
     assert_delivery_failure(
         FixtureRoute::OpenaiCustomChat,
         AttemptMode::Stream,
+        DeliveryFailure::TerminalChunkWrite,
+    );
+    assert_delivery_failure(
+        FixtureRoute::OpenaiCustomChat,
+        AttemptMode::Stream,
         DeliveryFailure::FinalFlush,
     );
+}
+
+#[test]
+fn api_contract_cross_route_downstream_failure_finalizes_only_cancelled() {
+    for route in [
+        FixtureRoute::RelayAnthropic,
+        FixtureRoute::QwenChat,
+        FixtureRoute::OpenaiResponses,
+    ] {
+        assert_delivery_failure(
+            route,
+            AttemptMode::Nonstream,
+            DeliveryFailure::FinalBodyWrite,
+        );
+        assert_delivery_failure(route, AttemptMode::Stream, DeliveryFailure::FinalFlush);
+    }
+}
+
+#[test]
+fn api_contract_cross_route_diagnostic_schema_has_only_closed_fields() {
+    for route in [
+        FixtureRoute::RelayAnthropic,
+        FixtureRoute::QwenChat,
+        FixtureRoute::OpenaiResponses,
+    ] {
+        assert_diagnostic_keys(
+            route,
+            &[
+                "schema_version",
+                "provider",
+                "route",
+                "correlation_id",
+                "outcome",
+                "posts",
+                "repairs",
+                "reason",
+            ],
+        );
+    }
+}
+
+#[test]
+fn api_contract_cross_route_raw_body_key_header_url_and_request_id_never_reach_diagnostic() {
+    for route in [
+        FixtureRoute::RelayAnthropic,
+        FixtureRoute::QwenChat,
+        FixtureRoute::OpenaiResponses,
+    ] {
+        assert_redacted(
+            route,
+            &[
+                "fixture-api-key",
+                "secret upstream text",
+                "private.example",
+                "Req-secret-cross-route",
+            ],
+        );
+    }
+}
+
+#[test]
+fn api_contract_cross_route_retry_wait_cancellation_stops_before_next_post() {
+    for route in [
+        FixtureRoute::RelayAnthropic,
+        FixtureRoute::QwenChat,
+        FixtureRoute::OpenaiResponses,
+    ] {
+        assert_wait_cancellation(route, 503, 1, &[500]);
+    }
+}
+
+#[test]
+fn api_harness_avoids_every_reserved_runtime_port() {
+    for _ in 0..64 {
+        let fixture = AcceptanceFixture::new(FixtureRoute::RelayAnthropic);
+        assert!(!RESERVED_PORTS.contains(&fixture.upstream_port()));
+        assert!(!RESERVED_PORTS.contains(&fixture.gateway_port()));
+    }
 }
 
 #[test]

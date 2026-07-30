@@ -1,6 +1,7 @@
 use std::fmt;
 
-use serde::Serialize;
+use serde::ser::SerializeStruct;
+use serde::{Serialize, Serializer};
 use serde_json::{json, Value};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -293,22 +294,20 @@ pub(crate) struct ProviderFailure {
     retry_after_seconds: Option<u64>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct AttemptDiagnostic {
-    outcome: AttemptOutcome,
+    schema_version: u8,
     provider: ProviderId,
     route: RouteMode,
     correlation_id: CorrelationId,
+    outcome: AttemptOutcome,
     posts: u8,
     repairs: u8,
+    reason: &'static str,
     delays_ms: Vec<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     mapped_status: Option<u16>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     upstream_status: Option<u16>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     failure_class: Option<FailureClass>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     retryable: Option<bool>,
 }
 
@@ -553,12 +552,18 @@ impl AttemptDiagnostic {
         snapshot: AttemptSnapshot,
     ) -> Self {
         Self {
-            outcome,
+            schema_version: 1,
             provider: context.provider,
             route: context.route,
             correlation_id: context.correlation_id.clone(),
+            outcome,
             posts: snapshot.posts,
             repairs: snapshot.repairs,
+            reason: match outcome {
+                AttemptOutcome::Completed => "completed",
+                AttemptOutcome::Failed => "failed",
+                AttemptOutcome::Cancelled => "cancelled",
+            },
             delays_ms: snapshot.delays_ms,
             mapped_status: None,
             upstream_status: None,
@@ -575,17 +580,90 @@ impl AttemptDiagnostic {
         failure: &ProviderFailure,
     ) -> Self {
         Self {
-            outcome: AttemptOutcome::Failed,
+            schema_version: 1,
             provider: context.provider,
             route: context.route,
             correlation_id: context.correlation_id.clone(),
+            outcome: AttemptOutcome::Failed,
             posts,
             repairs,
+            reason: failure.failure_class.reason_code(),
             delays_ms,
             mapped_status: Some(failure.status),
             upstream_status: failure.upstream_status,
             failure_class: Some(failure.failure_class),
             retryable: Some(failure.retryable),
+        }
+    }
+}
+
+impl Serialize for AttemptDiagnostic {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        if self.provider == ProviderId::Codex {
+            let mut fields = 7;
+            if self.mapped_status.is_some() {
+                fields += 1;
+            }
+            if self.upstream_status.is_some() {
+                fields += 1;
+            }
+            if self.failure_class.is_some() {
+                fields += 1;
+            }
+            if self.retryable.is_some() {
+                fields += 1;
+            }
+            let mut state = serializer.serialize_struct("AttemptDiagnostic", fields)?;
+            state.serialize_field("outcome", &self.outcome)?;
+            state.serialize_field("provider", &self.provider)?;
+            state.serialize_field("route", &self.route)?;
+            state.serialize_field("correlation_id", &self.correlation_id)?;
+            state.serialize_field("posts", &self.posts)?;
+            state.serialize_field("repairs", &self.repairs)?;
+            state.serialize_field("delays_ms", &self.delays_ms)?;
+            if let Some(mapped_status) = self.mapped_status {
+                state.serialize_field("mapped_status", &mapped_status)?;
+            }
+            if let Some(upstream_status) = self.upstream_status {
+                state.serialize_field("upstream_status", &upstream_status)?;
+            }
+            if let Some(failure_class) = self.failure_class {
+                state.serialize_field("failure_class", &failure_class)?;
+            }
+            if let Some(retryable) = self.retryable {
+                state.serialize_field("retryable", &retryable)?;
+            }
+            state.end()
+        } else {
+            let mut state = serializer.serialize_struct("AttemptDiagnostic", 8)?;
+            state.serialize_field("schema_version", &self.schema_version)?;
+            state.serialize_field("provider", &self.provider)?;
+            state.serialize_field("route", &self.route)?;
+            state.serialize_field("correlation_id", &self.correlation_id)?;
+            state.serialize_field("outcome", &self.outcome)?;
+            state.serialize_field("posts", &self.posts)?;
+            state.serialize_field("repairs", &self.repairs)?;
+            state.serialize_field("reason", &self.reason)?;
+            state.end()
+        }
+    }
+}
+
+impl FailureClass {
+    fn reason_code(self) -> &'static str {
+        match self {
+            Self::Authentication => "authentication",
+            Self::Authorization => "authorization",
+            Self::InvalidRequest => "invalid_request",
+            Self::Capability => "capability",
+            Self::Quota => "quota",
+            Self::RateLimit => "rate_limit",
+            Self::Transient => "transient",
+            Self::Network => "network",
+            Self::Protocol => "protocol",
         }
     }
 }
