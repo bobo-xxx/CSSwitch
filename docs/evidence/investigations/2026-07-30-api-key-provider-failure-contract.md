@@ -195,8 +195,26 @@ For completion, `reason` is exactly `{"kind":"completed","delay_count":0}`. For 
 
 Cross-route fixtures inject the sentinels `fixture-api-key`, `secret upstream text`, `private.example`, `Req-secret-cross-route`, and route-specific request IDs. Both caller output and serialized diagnostics assert that every sentinel is absent. The one-POST transport projection separately bounds retained HTTP failure-body semantics and exposes only closed rate/code/parameter facts plus allowlisted retry/request-ID metadata; raw upstream text does not enter the controller.
 
+## Post-review oversized-body remediation
+
+GitHub review identified that the one-POST HTTP projection read the 16 KiB plus one-byte oversize sentinel but truncated it before calling the scanner's size guard. An oversized body whose first 16 KiB contained a valid closed quota or rate code could therefore be classified from truncated semantics instead of failing closed.
+
+Commit `378d02063c3719396e6b1cc8795865ed077ae338` fixes that boundary. The regression constructs a `429` body with an early exact `insufficient_quota` code, pads it to 16 KiB, and appends one extra byte. Before the production change, the real `post_once` path failed the test by returning `Quota` plus `InsufficientQuota`; after the change it returns absent rate/code facts. The projection now parses only when the complete retained body is at most 16 KiB and rejects semantics immediately when the sentinel byte is present.
+
+Fresh deterministic verification of that remediation passed:
+
+```text
+focused regression: 1 passed; 0 failed
+Messages: 14 passed; 0 failed
+API-key acceptance: 22 passed; 0 failed
+full Gateway library: 392 passed; 0 failed
+Codex auth CLI: 3 passed; 0 failed
+documentation tests: 0 passed; 0 failed
+all-target/all-feature offline Clippy with warnings denied: clean
+```
+
 ## Limitations and review note
 
 - This is deterministic Linux-headless evidence, not live-provider or installed-runtime evidence. No transient failure, quota, authentication rejection, disconnect, or repair condition was induced against a real provider.
 - No macOS runtime was available. Shared Rust compilation/tests cover source compatibility, but real macOS runtime execution remains pending.
-- Publication and independent whole-branch review are controller-owned follow-up work. This evidence task does not push or deploy the branch.
+- The feature branch and PR were published after deterministic review; no installation, deployment, profile, proxy, port, credential, or running-runtime change was made.
