@@ -531,22 +531,13 @@ git commit -m "docs: record Linux launcher persistence verification"
 
 Expected: the commit contains only the sanitized Ticket 07 evidence update; the approved design/test commit remains separate.
 
-- [ ] **Step 6: Push the durable evidence and clean the ignored candidate**
-
-Run:
-
-```bash
-git push fork linux-headless-oauth
-```
-
-Expected: `fork/linux-headless-oauth` advances to the evidence commit.
+- [ ] **Step 6: Clean the ignored candidate and prepare the reviewed branch handoff**
 
 Delete `scratchpad/launcher-persistence/csswitch-codex.candidate` with `apply_patch`, remove the now-empty `scratchpad/launcher-persistence` directory, then run:
 
 ```bash
 git status --short --branch
 git rev-parse HEAD
-git rev-parse fork/linux-headless-oauth
 ```
 
-Expected: clean `linux-headless-oauth`, and local/remote revision IDs are identical. The rollback backup remains installed and is not deleted.
+Expected: a clean `launcher-persistence-hardening` branch. The rollback backup remains installed and is not deleted. After the final whole-branch review, use the `finishing-a-development-branch` workflow to integrate this branch into `linux-headless-oauth` and push the durable commits to `fork/linux-headless-oauth`.
