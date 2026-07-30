@@ -4,6 +4,53 @@ fn context(route: RouteMode) -> RouteContext {
     RouteContext::codex(route, CorrelationId::new("corr-0001").unwrap())
 }
 
+fn api_context(provider: ProviderId, route: RouteMode, policy: RetryPolicy) -> RouteContext {
+    RouteContext::api_key(
+        provider,
+        route,
+        CorrelationId::new("api-corr-0001").unwrap(),
+        policy,
+    )
+}
+
+#[test]
+fn api_key_adapter_and_transport_conversion_is_closed() {
+    assert_eq!(ProviderId::from_adapter("codex"), Some(ProviderId::Codex));
+    assert_eq!(
+        ProviderId::from_adapter("deepseek"),
+        Some(ProviderId::Deepseek)
+    );
+    assert_eq!(ProviderId::from_adapter("qwen"), Some(ProviderId::Qwen));
+    assert_eq!(ProviderId::from_adapter("relay"), Some(ProviderId::Relay));
+    assert_eq!(
+        ProviderId::from_adapter("openai-custom"),
+        Some(ProviderId::OpenaiCustom)
+    );
+    assert_eq!(
+        ProviderId::from_adapter("openai-responses"),
+        Some(ProviderId::OpenaiResponses)
+    );
+    assert_eq!(ProviderId::from_adapter("unknown"), None);
+
+    assert_eq!(
+        RouteMode::from_api_key_transport("anthropic_messages"),
+        Some(RouteMode::AnthropicMessages)
+    );
+    assert_eq!(
+        RouteMode::from_api_key_transport("openai_chat"),
+        Some(RouteMode::OpenaiChat)
+    );
+    assert_eq!(
+        RouteMode::from_api_key_transport("openai_responses"),
+        Some(RouteMode::OpenaiResponses)
+    );
+    assert_eq!(
+        RouteMode::from_api_key_transport("codex_responses_sse"),
+        None
+    );
+    assert_eq!(RouteMode::from_api_key_transport("unknown"), None);
+}
+
 #[test]
 fn request_id_uses_positive_allowlist_and_length_bound() {
     assert_eq!(
@@ -47,6 +94,75 @@ fn permanent_failure_preserves_legacy_shape_and_omits_unknown_optionals() {
                 "upstream_status": 422
             }
         })
+    );
+}
+
+#[test]
+fn redirect_projection_is_scoped_to_openai_routes() {
+    let redirect = FailureObservation::Http {
+        status: 307,
+        rate_kind: None,
+        retry_after_seconds: None,
+        request_id: None,
+        error_code: ErrorCode::Absent,
+        error_param: ErrorParam::Absent,
+    };
+
+    let anthropic_failure = ProviderFailure::from_observation(
+        &api_context(
+            ProviderId::Relay,
+            RouteMode::AnthropicMessages,
+            RetryPolicy::ANTHROPIC_MESSAGES,
+        ),
+        &redirect,
+        false,
+    );
+    assert_eq!(anthropic_failure.status(), 502);
+    assert_eq!(
+        anthropic_failure.anthropic_json()["error"]["route"],
+        "anthropic_messages"
+    );
+    assert_eq!(
+        anthropic_failure.anthropic_json()["error"]["upstream_status"],
+        307
+    );
+
+    let openai_chat_failure = ProviderFailure::from_observation(
+        &api_context(
+            ProviderId::OpenaiCustom,
+            RouteMode::OpenaiChat,
+            RetryPolicy::OPENAI_CHAT,
+        ),
+        &redirect,
+        false,
+    );
+    assert_eq!(openai_chat_failure.status(), 307);
+    assert_eq!(
+        openai_chat_failure.anthropic_json()["error"]["route"],
+        "openai_chat"
+    );
+    assert_eq!(
+        openai_chat_failure.anthropic_json()["error"]["upstream_status"],
+        307
+    );
+
+    let openai_responses_failure = ProviderFailure::from_observation(
+        &api_context(
+            ProviderId::OpenaiResponses,
+            RouteMode::OpenaiResponses,
+            RetryPolicy::OPENAI_RESPONSES,
+        ),
+        &redirect,
+        false,
+    );
+    assert_eq!(openai_responses_failure.status(), 307);
+    assert_eq!(
+        openai_responses_failure.anthropic_json()["error"]["route"],
+        "openai_responses"
+    );
+    assert_eq!(
+        openai_responses_failure.anthropic_json()["error"]["upstream_status"],
+        307
     );
 }
 
@@ -137,6 +253,48 @@ fn diagnostic_schema_has_no_arbitrary_string_slot() {
     );
 }
 
+#[test]
+fn api_key_diagnostic_reason_is_closed_structured_projection() {
+    let context = api_context(
+        ProviderId::Qwen,
+        RouteMode::OpenaiChat,
+        RetryPolicy::OPENAI_CHAT,
+    );
+    let failure = ProviderFailure::from_observation(
+        &context,
+        &FailureObservation::Http {
+            status: 503,
+            rate_kind: None,
+            retry_after_seconds: None,
+            request_id: RequestId::new("Req-secret-03"),
+            error_code: ErrorCode::RateLimitError,
+            error_param: ErrorParam::Absent,
+        },
+        true,
+    );
+    let diagnostic = AttemptDiagnostic::failed(&context, 3, 0, vec![500, 1_000], &failure);
+    assert_eq!(
+        serde_json::to_value(diagnostic).unwrap(),
+        serde_json::json!({
+            "schema_version": 1,
+            "provider": "qwen",
+            "route": "openai_chat",
+            "correlation_id": "api-corr-0001",
+            "outcome": "failed",
+            "posts": 3,
+            "repairs": 0,
+            "reason": {
+                "kind": "failed",
+                "delay_count": 2,
+                "mapped_status": 502,
+                "upstream_status": 503,
+                "failure_class": "transient",
+                "retryable": true
+            }
+        })
+    );
+}
+
 fn http(
     status: u16,
     rate_kind: Option<RateKind>,
@@ -150,6 +308,104 @@ fn http(
         error_code: ErrorCode::Absent,
         error_param: ErrorParam::Absent,
     }
+}
+
+#[test]
+fn anthropic_and_openai_policies_differ_only_on_conflict() {
+    assert!(!RetryPolicy::ANTHROPIC_MESSAGES.allows(&http(409, None, None)));
+    assert!(RetryPolicy::OPENAI_CHAT.allows(&http(409, None, None)));
+    assert!(RetryPolicy::OPENAI_RESPONSES.allows(&http(409, None, None)));
+    for policy in [
+        RetryPolicy::ANTHROPIC_MESSAGES,
+        RetryPolicy::OPENAI_CHAT,
+        RetryPolicy::OPENAI_RESPONSES,
+    ] {
+        assert!(policy.allows(&http(408, None, None)));
+        assert!(policy.allows(&http(429, None, None)));
+        assert!(policy.allows(&http(529, None, None)));
+        assert!(policy.allows(&FailureObservation::Network(NetworkKind::Connect)));
+        assert!(policy.allows(&FailureObservation::Network(NetworkKind::Timeout)));
+        assert!(!policy.allows(&FailureObservation::Network(NetworkKind::Read)));
+        assert!(!policy.allows(&http(422, None, None)));
+    }
+}
+
+#[test]
+fn anthropic_messages_conflict_is_permanent_invalid_request() {
+    let context = api_context(
+        ProviderId::Relay,
+        RouteMode::AnthropicMessages,
+        RetryPolicy::ANTHROPIC_MESSAGES,
+    );
+    let failure = ProviderFailure::from_observation(&context, &http(409, None, None), false);
+    assert_eq!(failure.status(), 409);
+    assert_eq!(failure.failure_class(), FailureClass::InvalidRequest);
+    assert!(!failure.retryable());
+    assert_eq!(
+        failure.anthropic_json(),
+        serde_json::json!({
+            "type": "error",
+            "error": {
+                "type": "invalid_request_error",
+                "message": "Provider rejected the request",
+                "provider": "relay",
+                "route": "anthropic_messages",
+                "failure_class": "invalid_request",
+                "retryable": false,
+                "correlation_id": "api-corr-0001",
+                "recovery": "Correct the request or select a compatible model",
+                "upstream_status": 409
+            }
+        })
+    );
+}
+
+#[test]
+fn api_key_quota_is_terminal_and_repair_is_structurally_disabled() {
+    let context = api_context(
+        ProviderId::Relay,
+        RouteMode::AnthropicMessages,
+        RetryPolicy::ANTHROPIC_MESSAGES,
+    );
+    let mut controller = AttemptController::new(context, false);
+    controller.begin_post().unwrap();
+    let quota = FailureObservation::Http {
+        status: 429,
+        rate_kind: Some(RateKind::Quota),
+        retry_after_seconds: Some(0),
+        request_id: None,
+        error_code: ErrorCode::InsufficientQuota,
+        error_param: ErrorParam::Absent,
+    };
+    assert!(matches!(
+        controller.observe(quota).unwrap(),
+        AttemptDirective::Fail(_)
+    ));
+    assert_eq!(controller.snapshot().posts, 1);
+    assert_eq!(controller.snapshot().repairs, 0);
+}
+
+#[test]
+fn api_key_unknown_429_is_retryable_after_policy_budget_exhaustion() {
+    let context = api_context(
+        ProviderId::Relay,
+        RouteMode::AnthropicMessages,
+        RetryPolicy::ANTHROPIC_MESSAGES,
+    );
+    let mut controller = AttemptController::new(context, false);
+    for expected_delay in [500, 1_000] {
+        controller.begin_post().unwrap();
+        assert_eq!(
+            controller.observe(http(429, None, None)).unwrap(),
+            AttemptDirective::RetryAfter(expected_delay)
+        );
+    }
+    controller.begin_post().unwrap();
+    let AttemptDirective::Fail(failure) = controller.observe(http(429, None, None)).unwrap() else {
+        panic!("exhausted API-key 429 must fail");
+    };
+    assert!(failure.retryable());
+    assert_eq!(controller.snapshot().posts, 3);
 }
 
 #[test]

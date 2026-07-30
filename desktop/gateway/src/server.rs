@@ -12,6 +12,7 @@ use crate::auth::{strip_path_secret, AuthResult};
 use crate::config::GatewayConfig;
 use crate::{
     anthropic_compat::{self, AnthropicMetadata, KimiServerToolFilter},
+    api_key_attempt::{ApiKeyAttemptSequence, ApiKeyPostOnceTransport, AttemptRuntime, OpenResult},
     codex_auth, codex_models, codex_protocol, codex_transport, connect,
     dsml_shim::{DsmlDetector, DsmlStreamRewriter},
     messages, models, openai_chat, openai_responses, policy,
@@ -89,6 +90,13 @@ enum StreamTermination {
     UpstreamReadError,
     ProtocolError,
     DownstreamWriteError,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ApiKeyStreamDelivery {
+    Completed,
+    Cancelled,
+    ProtocolFailure,
 }
 
 impl StreamFilter {
@@ -188,7 +196,7 @@ fn json_bytes(value: Value) -> Vec<u8> {
     serde_json::to_vec(&value).unwrap_or_else(|_| b"{\"error\":\"internal\"}".to_vec())
 }
 
-fn write_response_checked<W: Write>(
+fn write_response_checked<W: Write + ?Sized>(
     stream: &mut W,
     status: u16,
     reason: &str,
@@ -204,6 +212,7 @@ fn write_response_checked<W: Write>(
     stream.flush()
 }
 
+#[allow(dead_code)]
 fn write_response(
     stream: &mut TcpStream,
     status: u16,
@@ -214,7 +223,7 @@ fn write_response(
     let _ = write_response_checked(stream, status, reason, content_type, body);
 }
 
-fn write_json_checked<W: Write>(
+fn write_json_checked<W: Write + ?Sized>(
     stream: &mut W,
     status: u16,
     reason: &str,
@@ -488,7 +497,7 @@ fn handle_get(
     }
 }
 
-fn write_chunk<W: Write>(stream: &mut W, chunk: &[u8]) -> std::io::Result<()> {
+fn write_chunk<W: Write + ?Sized>(stream: &mut W, chunk: &[u8]) -> std::io::Result<()> {
     write!(stream, "{:x}\r\n", chunk.len())?;
     stream.write_all(chunk)?;
     stream.write_all(b"\r\n")?;
@@ -619,6 +628,7 @@ where
     }
 }
 
+#[allow(dead_code)]
 fn handle_stream(
     stream: &mut TcpStream,
     cfg: &GatewayConfig,
@@ -657,6 +667,411 @@ fn handle_stream(
     }
     let _ = stream.write_all(b"0\r\n\r\n");
     let _ = stream.flush();
+}
+
+fn handle_api_key_stream(
+    stream: &mut TcpStream,
+    cfg: &GatewayConfig,
+    body: Vec<u8>,
+    mut filter: Option<StreamFilter>,
+) {
+    let context = match api_key_route_context(cfg) {
+        Ok(context) => context,
+        Err(error) => {
+            api_error_json(stream, 500, &error);
+            return;
+        }
+    };
+    let mut transport = ApiKeyPostOnceTransport::new(cfg, messages::AttemptMode::Stream);
+    let mut runtime = ProductionProviderAttemptRuntime::new(stream);
+    let opened = match ApiKeyAttemptSequence::open(
+        context,
+        &body,
+        messages::AttemptMode::Stream,
+        &mut transport,
+        &mut runtime,
+    ) {
+        OpenResult::Opened(opened) => opened,
+        OpenResult::Failed(terminal) | OpenResult::Cancelled(terminal) => {
+            finalize_api_key_terminal(stream, terminal);
+            return;
+        }
+    };
+    let (opened, mut controller) = opened.into_parts();
+    let mut upstream = match opened.into_stream() {
+        Ok(upstream) => upstream,
+        Err(observation) => {
+            let failure = provider_failure_from_open_observation(&mut controller, observation);
+            let outcome = if write_provider_failure(stream, &failure).is_ok() {
+                ApiKeyFinalOutcome::Failed(failure)
+            } else {
+                ApiKeyFinalOutcome::Cancelled
+            };
+            finalize_api_key_controller(&mut controller, outcome);
+            return;
+        }
+    };
+    match deliver_api_key_response(stream, |writer| {
+        deliver_api_key_stream_response(writer, &mut upstream, &mut filter)
+    }) {
+        ApiKeyStreamDelivery::Completed => {
+            let diagnostic = finalize_opened_delivery(&mut controller, std::io::Result::Ok(()));
+            emit_api_key_attempt_diagnostic(diagnostic);
+        }
+        ApiKeyStreamDelivery::Cancelled => {
+            let diagnostic = finalize_opened_delivery(
+                &mut controller,
+                std::io::Result::Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "downstream delivery failed",
+                )),
+            );
+            emit_api_key_attempt_diagnostic(diagnostic);
+        }
+        ApiKeyStreamDelivery::ProtocolFailure => {
+            let failure = provider_failure_from_open_observation(
+                &mut controller,
+                crate::provider_failure::FailureObservation::Protocol(
+                    crate::provider_failure::ProtocolKind::InvalidResponse,
+                ),
+            );
+            finalize_api_key_controller(&mut controller, ApiKeyFinalOutcome::Failed(failure));
+        }
+    }
+}
+
+fn deliver_api_key_stream_response<W: Write + ?Sized>(
+    stream: &mut W,
+    upstream: &mut messages::UpstreamStream,
+    filter: &mut Option<StreamFilter>,
+) -> ApiKeyStreamDelivery {
+    if write!(
+        stream,
+        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n"
+    )
+    .and_then(|_| stream.flush())
+    .is_err()
+    {
+        return ApiKeyStreamDelivery::Cancelled;
+    }
+    let termination = forward_stream_body(&mut upstream.response, &[], filter, |chunk| {
+        write_chunk(stream, chunk)
+    });
+    match termination {
+        StreamTermination::NormalEof => {
+            if let Some(filter) = filter.as_ref() {
+                filter.log_stats();
+            }
+            if stream
+                .write_all(b"0\r\n\r\n")
+                .and_then(|_| stream.flush())
+                .is_ok()
+            {
+                ApiKeyStreamDelivery::Completed
+            } else {
+                ApiKeyStreamDelivery::Cancelled
+            }
+        }
+        StreamTermination::DownstreamWriteError => ApiKeyStreamDelivery::Cancelled,
+        StreamTermination::UpstreamTerminalError
+        | StreamTermination::UpstreamReadError
+        | StreamTermination::ProtocolError => {
+            if stream
+                .write_all(b"0\r\n\r\n")
+                .and_then(|_| stream.flush())
+                .is_ok()
+            {
+                ApiKeyStreamDelivery::ProtocolFailure
+            } else {
+                ApiKeyStreamDelivery::Cancelled
+            }
+        }
+    }
+}
+
+fn handle_api_key_nonstream(
+    stream: &mut TcpStream,
+    cfg: &GatewayConfig,
+    body: Vec<u8>,
+    finish_body: impl FnOnce(Vec<u8>) -> Result<Vec<u8>, String>,
+) {
+    let context = match api_key_route_context(cfg) {
+        Ok(context) => context,
+        Err(error) => {
+            api_error_json(stream, 500, &error);
+            return;
+        }
+    };
+    let mut transport = ApiKeyPostOnceTransport::new(cfg, messages::AttemptMode::Nonstream);
+    let mut runtime = ProductionProviderAttemptRuntime::new(stream);
+    let opened = match ApiKeyAttemptSequence::open(
+        context,
+        &body,
+        messages::AttemptMode::Nonstream,
+        &mut transport,
+        &mut runtime,
+    ) {
+        OpenResult::Opened(opened) => opened,
+        OpenResult::Failed(terminal) | OpenResult::Cancelled(terminal) => {
+            finalize_api_key_terminal(stream, terminal);
+            return;
+        }
+    };
+    let (opened, mut controller) = opened.into_parts();
+    let resp = match opened.into_nonstream() {
+        Ok(resp) => resp,
+        Err(observation) => {
+            let failure = provider_failure_from_open_observation(&mut controller, observation);
+            let outcome = if write_provider_failure(stream, &failure).is_ok() {
+                ApiKeyFinalOutcome::Failed(failure)
+            } else {
+                ApiKeyFinalOutcome::Cancelled
+            };
+            finalize_api_key_controller(&mut controller, outcome);
+            return;
+        }
+    };
+    if serde_json::from_slice::<Value>(&resp.body).is_err() {
+        let failure = provider_failure_from_open_observation(
+            &mut controller,
+            crate::provider_failure::FailureObservation::Protocol(
+                crate::provider_failure::ProtocolKind::InvalidResponse,
+            ),
+        );
+        let outcome = if write_provider_failure(stream, &failure).is_ok() {
+            ApiKeyFinalOutcome::Failed(failure)
+        } else {
+            ApiKeyFinalOutcome::Cancelled
+        };
+        finalize_api_key_controller(&mut controller, outcome);
+        return;
+    }
+    let body = match finish_body(resp.body) {
+        Ok(body) => body,
+        Err(_) => {
+            let failure = provider_failure_from_open_observation(
+                &mut controller,
+                crate::provider_failure::FailureObservation::Protocol(
+                    crate::provider_failure::ProtocolKind::InvalidResponse,
+                ),
+            );
+            let outcome = if write_provider_failure(stream, &failure).is_ok() {
+                ApiKeyFinalOutcome::Failed(failure)
+            } else {
+                ApiKeyFinalOutcome::Cancelled
+            };
+            finalize_api_key_controller(&mut controller, outcome);
+            return;
+        }
+    };
+    let delivery = deliver_api_key_response(stream, |writer| {
+        write_response_checked(
+            writer,
+            resp.status,
+            status_reason(resp.status),
+            &resp.content_type,
+            &body,
+        )
+    });
+    let diagnostic = finalize_opened_delivery(&mut controller, delivery);
+    emit_api_key_attempt_diagnostic(diagnostic);
+}
+
+fn deliver_api_key_response<W: Write, T>(
+    stream: &mut W,
+    deliver: impl FnOnce(&mut dyn Write) -> T,
+) -> T {
+    #[cfg(all(test, feature = "acceptance-build"))]
+    {
+        if api_key_acceptance::delivery_failure_enabled() {
+            return api_key_acceptance::provider_delivery_result(deliver)
+                .expect("acceptance delivery hook enabled");
+        }
+    }
+    deliver(stream)
+}
+
+fn deliver_openai_chat_response<W: Write + ?Sized>(
+    stream: &mut W,
+    anthropic_resp: Value,
+    is_stream: bool,
+) -> std::io::Result<()> {
+    if is_stream {
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n"
+        )?;
+        stream.flush()?;
+        for (event, data) in openai_chat::replay_as_sse_events(&anthropic_resp) {
+            write_chunk(stream, &sse_event(&event, &data))?;
+        }
+        stream.write_all(b"0\r\n\r\n")?;
+        stream.flush()
+    } else {
+        write_json_checked(stream, 200, "OK", anthropic_resp)
+    }
+}
+
+fn handle_openai_chat_api_key(
+    stream: &mut TcpStream,
+    cfg: &GatewayConfig,
+    body: Vec<u8>,
+    model_id: &str,
+    target_model: &str,
+    reasoning_signer: &openai_chat::ReasoningSigner,
+    is_stream: bool,
+) {
+    let context = match api_key_route_context(cfg) {
+        Ok(context) => context,
+        Err(error) => {
+            api_error_json(stream, 500, &error);
+            return;
+        }
+    };
+    let mut transport = ApiKeyPostOnceTransport::new(cfg, messages::AttemptMode::Nonstream);
+    let mut runtime = ProductionProviderAttemptRuntime::new(stream);
+    let opened = match ApiKeyAttemptSequence::open(
+        context,
+        &body,
+        messages::AttemptMode::Nonstream,
+        &mut transport,
+        &mut runtime,
+    ) {
+        OpenResult::Opened(opened) => opened,
+        OpenResult::Failed(terminal) | OpenResult::Cancelled(terminal) => {
+            finalize_api_key_terminal(stream, terminal);
+            return;
+        }
+    };
+    let (opened, mut controller) = opened.into_parts();
+    let resp = match opened.into_nonstream() {
+        Ok(resp) => resp,
+        Err(observation) => {
+            let failure = provider_failure_from_open_observation(&mut controller, observation);
+            let outcome = if write_provider_failure(stream, &failure).is_ok() {
+                ApiKeyFinalOutcome::Failed(failure)
+            } else {
+                ApiKeyFinalOutcome::Cancelled
+            };
+            finalize_api_key_controller(&mut controller, outcome);
+            return;
+        }
+    };
+    let openai_resp: Value = match serde_json::from_slice(&resp.body) {
+        Ok(value) => value,
+        Err(_) => {
+            let failure = provider_failure_from_open_observation(
+                &mut controller,
+                crate::provider_failure::FailureObservation::Protocol(
+                    crate::provider_failure::ProtocolKind::InvalidResponse,
+                ),
+            );
+            let outcome = if write_provider_failure(stream, &failure).is_ok() {
+                ApiKeyFinalOutcome::Failed(failure)
+            } else {
+                ApiKeyFinalOutcome::Cancelled
+            };
+            finalize_api_key_controller(&mut controller, outcome);
+            return;
+        }
+    };
+    let anthropic_resp = match openai_chat::openai_to_anthropic(
+        &openai_resp,
+        model_id,
+        target_model,
+        reasoning_signer,
+    ) {
+        Ok(response) => response,
+        Err(_) => {
+            let failure = provider_failure_from_open_observation(
+                &mut controller,
+                crate::provider_failure::FailureObservation::Protocol(
+                    crate::provider_failure::ProtocolKind::InvalidResponse,
+                ),
+            );
+            let outcome = if write_provider_failure(stream, &failure).is_ok() {
+                ApiKeyFinalOutcome::Failed(failure)
+            } else {
+                ApiKeyFinalOutcome::Cancelled
+            };
+            finalize_api_key_controller(&mut controller, outcome);
+            return;
+        }
+    };
+    let delivery = deliver_api_key_response(stream, |writer| {
+        deliver_openai_chat_response(writer, anthropic_resp.clone(), is_stream)
+    });
+    let diagnostic = finalize_opened_delivery(&mut controller, delivery);
+    emit_api_key_attempt_diagnostic(diagnostic);
+}
+
+fn handle_openai_responses_api_key(
+    stream: &mut TcpStream,
+    cfg: &GatewayConfig,
+    body: Vec<u8>,
+    model_id: &str,
+    is_stream: bool,
+) {
+    let context = match api_key_route_context(cfg) {
+        Ok(context) => context,
+        Err(error) => {
+            api_error_json(stream, 500, &error);
+            return;
+        }
+    };
+    let mut transport = ApiKeyPostOnceTransport::new(cfg, messages::AttemptMode::Nonstream);
+    let mut runtime = ProductionProviderAttemptRuntime::new(stream);
+    let opened = match ApiKeyAttemptSequence::open(
+        context,
+        &body,
+        messages::AttemptMode::Nonstream,
+        &mut transport,
+        &mut runtime,
+    ) {
+        OpenResult::Opened(opened) => opened,
+        OpenResult::Failed(terminal) | OpenResult::Cancelled(terminal) => {
+            finalize_api_key_terminal(stream, terminal);
+            return;
+        }
+    };
+    let (opened, mut controller) = opened.into_parts();
+    let resp = match opened.into_nonstream() {
+        Ok(resp) => resp,
+        Err(observation) => {
+            let failure = provider_failure_from_open_observation(&mut controller, observation);
+            let outcome = if write_provider_failure(stream, &failure).is_ok() {
+                ApiKeyFinalOutcome::Failed(failure)
+            } else {
+                ApiKeyFinalOutcome::Cancelled
+            };
+            finalize_api_key_controller(&mut controller, outcome);
+            return;
+        }
+    };
+    let openai_resp: Value = match serde_json::from_slice(&resp.body) {
+        Ok(value) => value,
+        Err(_) => {
+            let failure = provider_failure_from_open_observation(
+                &mut controller,
+                crate::provider_failure::FailureObservation::Protocol(
+                    crate::provider_failure::ProtocolKind::InvalidResponse,
+                ),
+            );
+            let outcome = if write_provider_failure(stream, &failure).is_ok() {
+                ApiKeyFinalOutcome::Failed(failure)
+            } else {
+                ApiKeyFinalOutcome::Cancelled
+            };
+            finalize_api_key_controller(&mut controller, outcome);
+            return;
+        }
+    };
+    let anthropic_resp = openai_responses::openai_to_anthropic(&openai_resp, model_id);
+    let delivery = deliver_api_key_response(stream, |writer| {
+        deliver_openai_chat_response(writer, anthropic_resp.clone(), is_stream)
+    });
+    let diagnostic = finalize_opened_delivery(&mut controller, delivery);
+    emit_api_key_attempt_diagnostic(diagnostic);
 }
 
 fn log_relay_metadata(metadata: &AnthropicMetadata, is_stream: bool, message_count: usize) {
@@ -1117,6 +1532,7 @@ fn caller_allows_automatic_tool_choice(raw: &Value) -> bool {
 }
 
 static CODEX_CORRELATION_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+static API_KEY_CORRELATION_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 fn next_codex_correlation_id() -> crate::provider_failure::CorrelationId {
     let sequence = CODEX_CORRELATION_SEQUENCE.fetch_add(1, Ordering::Relaxed);
@@ -1124,8 +1540,36 @@ fn next_codex_correlation_id() -> crate::provider_failure::CorrelationId {
         .expect("generated Codex correlation ID is allowlisted")
 }
 
-fn write_provider_failure(
-    stream: &mut TcpStream,
+fn next_api_key_correlation_id() -> crate::provider_failure::CorrelationId {
+    let sequence = API_KEY_CORRELATION_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    crate::provider_failure::CorrelationId::new(format!("api-key-{sequence:016x}"))
+        .expect("generated API-key correlation ID is allowlisted")
+}
+
+fn api_key_route_context(
+    cfg: &GatewayConfig,
+) -> Result<crate::provider_failure::RouteContext, String> {
+    let provider = crate::provider_failure::ProviderId::from_adapter(&cfg.provider)
+        .ok_or("provider contract adapter is unsupported")?;
+    let contract = cfg
+        .provider_contract
+        .as_ref()
+        .ok_or("provider contract is unavailable")?;
+    let route = crate::provider_failure::RouteMode::from_api_key_transport(&contract.transport)
+        .ok_or("provider contract transport is unsupported")?;
+    let retry_policy = contract
+        .inference_retry
+        .ok_or("provider contract retry policy is unavailable")?;
+    Ok(crate::provider_failure::RouteContext::api_key(
+        provider,
+        route,
+        next_api_key_correlation_id(),
+        retry_policy,
+    ))
+}
+
+fn write_provider_failure<W: Write + ?Sized>(
+    stream: &mut W,
     failure: &crate::provider_failure::ProviderFailure,
 ) -> std::io::Result<()> {
     write_json_checked(
@@ -1134,6 +1578,126 @@ fn write_provider_failure(
         status_reason(failure.status()),
         failure.anthropic_json(),
     )
+}
+
+struct ProductionProviderAttemptRuntime {
+    downstream: Option<TcpStream>,
+}
+
+impl ProductionProviderAttemptRuntime {
+    fn new(stream: &TcpStream) -> Self {
+        Self {
+            downstream: stream.try_clone().ok(),
+        }
+    }
+}
+
+impl AttemptRuntime for ProductionProviderAttemptRuntime {
+    fn cancelled(&mut self) -> bool {
+        self.downstream.as_ref().is_some_and(downstream_closed)
+    }
+
+    fn wait(&mut self, delay_ms: u64) -> bool {
+        #[cfg(all(test, feature = "acceptance-build"))]
+        {
+            api_key_acceptance::record_attempt_delay(delay_ms);
+            if api_key_acceptance::cancel_recorded_wait() {
+                return false;
+            }
+            !self.cancelled()
+        }
+        #[cfg(not(all(test, feature = "acceptance-build")))]
+        {
+            let deadline = std::time::Instant::now() + Duration::from_millis(delay_ms);
+            while std::time::Instant::now() < deadline {
+                if self.cancelled() {
+                    return false;
+                }
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                thread::sleep(remaining.min(Duration::from_millis(25)));
+            }
+            !self.cancelled()
+        }
+    }
+}
+
+fn emit_api_key_attempt_diagnostic(diagnostic: crate::provider_failure::AttemptDiagnostic) {
+    #[cfg(all(test, feature = "acceptance-build"))]
+    api_key_acceptance::record_attempt_diagnostic(diagnostic.clone());
+    if let Ok(value) = serde_json::to_string(&diagnostic) {
+        eprintln!("provider_attempt {value}");
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ApiKeyFinalOutcome {
+    Failed(crate::provider_failure::ProviderFailure),
+    Cancelled,
+}
+
+fn finalize_api_key_controller(
+    controller: &mut crate::provider_failure::AttemptController,
+    outcome: ApiKeyFinalOutcome,
+) {
+    let diagnostic = match outcome {
+        ApiKeyFinalOutcome::Failed(failure) => controller
+            .failed_diagnostic(&failure)
+            .expect("failed API-key attempt finalizes exactly once"),
+        ApiKeyFinalOutcome::Cancelled => controller
+            .cancelled_diagnostic()
+            .expect("cancelled API-key attempt finalizes exactly once"),
+    };
+    emit_api_key_attempt_diagnostic(diagnostic);
+}
+
+fn deliver_provider_failure<W: Write + ?Sized>(
+    writer: &mut W,
+    terminal: &mut crate::api_key_attempt::TerminalAttempt,
+) -> crate::provider_failure::AttemptDiagnostic {
+    match terminal.failure.clone() {
+        Some(failure) if write_provider_failure(writer, &failure).is_ok() => terminal
+            .failed_diagnostic()
+            .expect("failed API-key terminal finalizes once"),
+        _ => terminal
+            .cancelled_diagnostic()
+            .expect("cancelled API-key terminal finalizes once"),
+    }
+}
+
+fn finalize_opened_delivery(
+    controller: &mut crate::provider_failure::AttemptController,
+    delivery: std::io::Result<()>,
+) -> crate::provider_failure::AttemptDiagnostic {
+    if delivery.is_ok() {
+        controller
+            .completed_diagnostic()
+            .expect("completed API-key opened attempt finalizes once")
+    } else {
+        controller
+            .cancelled_diagnostic()
+            .expect("cancelled API-key opened attempt finalizes once")
+    }
+}
+
+fn finalize_api_key_terminal(
+    stream: &mut TcpStream,
+    mut terminal: crate::api_key_attempt::TerminalAttempt,
+) {
+    let diagnostic = deliver_provider_failure(stream, &mut terminal);
+    emit_api_key_attempt_diagnostic(diagnostic);
+}
+
+fn provider_failure_from_open_observation(
+    controller: &mut crate::provider_failure::AttemptController,
+    observation: crate::provider_failure::FailureObservation,
+) -> crate::provider_failure::ProviderFailure {
+    let directive = controller
+        .observe(observation)
+        .expect("opened API-key response failure is authorized");
+    let crate::provider_failure::AttemptDirective::Fail(failure) = directive else {
+        panic!("opened API-key response failure cannot replay");
+    };
+    failure
 }
 
 trait CodexAttemptRuntime {
@@ -1671,53 +2235,19 @@ fn handle_messages(
         if let Some(metadata) = responses_metadata.as_ref() {
             log_responses_metadata(&transformed, metadata, is_stream);
         }
-        match messages::post_nonstream(cfg, body) {
-            Ok(resp) => {
-                let openai_resp: Value = match serde_json::from_slice(&resp.body) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        api_error_json(stream, 502, &e.to_string());
-                        return;
-                    }
-                };
-                let anthropic_resp = if cfg.provider == "openai-responses" {
-                    Ok(openai_responses::openai_to_anthropic(
-                        &openai_resp,
-                        &model_id,
-                    ))
-                } else {
-                    openai_chat::openai_to_anthropic(
-                        &openai_resp,
-                        &model_id,
-                        &target_model,
-                        &reasoning_signer,
-                    )
-                };
-                let anthropic_resp = match anthropic_resp {
-                    Ok(response) => response,
-                    Err(error) => {
-                        api_error_json(stream, 502, &error);
-                        return;
-                    }
-                };
-                if is_stream {
-                    let _ = write!(
-                        stream,
-                        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n"
-                    );
-                    for (event, data) in openai_chat::replay_as_sse_events(&anthropic_resp) {
-                        if write_chunk(stream, &sse_event(&event, &data)).is_err() {
-                            return;
-                        }
-                    }
-                    let _ = stream.write_all(b"0\r\n\r\n");
-                    let _ = stream.flush();
-                } else {
-                    write_json(stream, 200, "OK", anthropic_resp);
-                }
-            }
-            Err(e) => api_error_json(stream, e.status, &e.detail),
+        if cfg.provider != "openai-responses" {
+            handle_openai_chat_api_key(
+                stream,
+                cfg,
+                body,
+                &model_id,
+                &target_model,
+                &reasoning_signer,
+                is_stream,
+            );
+            return;
         }
+        handle_openai_responses_api_key(stream, cfg, body, &model_id, is_stream);
         return;
     }
     if cfg.provider == "relay" {
@@ -1752,30 +2282,17 @@ fn handle_messages(
             } else {
                 None
             };
-            handle_stream(stream, cfg, transformed, filter);
+            handle_api_key_stream(stream, cfg, transformed, filter);
             return;
         }
-        match messages::post_nonstream(cfg, transformed) {
-            Ok(mut resp) => {
-                if metadata.target_model.to_ascii_lowercase().contains("kimi") {
-                    resp.body = match anthropic_compat::filter_kimi_nonstream_response(&resp.body) {
-                        Ok(body) => body,
-                        Err(error) => {
-                            api_error_json(stream, 502, &error);
-                            return;
-                        }
-                    };
-                }
-                write_response(
-                    stream,
-                    resp.status,
-                    status_reason(resp.status),
-                    &resp.content_type,
-                    &resp.body,
-                )
+        let is_kimi = metadata.target_model.to_ascii_lowercase().contains("kimi");
+        handle_api_key_nonstream(stream, cfg, transformed, |body| {
+            if is_kimi {
+                anthropic_compat::filter_kimi_nonstream_response(&body)
+            } else {
+                Ok(body)
             }
-            Err(e) => api_error_json(stream, e.status, &e.detail),
-        }
+        });
         return;
     }
     let transformed = match policy::transform_request(raw, &target_model) {
@@ -1787,23 +2304,17 @@ fn handle_messages(
     };
     if is_stream {
         let filter = dsml_stream_filter(cfg, &known_tools, dsml_request_nonce.as_deref());
-        handle_stream(stream, cfg, transformed, filter);
+        handle_api_key_stream(stream, cfg, transformed, filter);
         return;
     }
-    match messages::post_nonstream(cfg, transformed) {
-        Ok(resp) => {
-            let body =
-                apply_dsml_nonstream(cfg, &known_tools, resp.body, dsml_request_nonce.as_deref());
-            write_response(
-                stream,
-                resp.status,
-                status_reason(resp.status),
-                &resp.content_type,
-                &body,
-            )
-        }
-        Err(e) => api_error_json(stream, e.status, &e.detail),
-    }
+    handle_api_key_nonstream(stream, cfg, transformed, |body| {
+        Ok(apply_dsml_nonstream(
+            cfg,
+            &known_tools,
+            body,
+            dsml_request_nonce.as_deref(),
+        ))
+    });
 }
 
 fn handle_post(
@@ -2462,6 +2973,9 @@ pub fn serve(cfg: GatewayConfig) -> Result<(), String> {
 
 #[cfg(all(test, feature = "acceptance-build"))]
 mod codex_acceptance;
+
+#[cfg(all(test, feature = "acceptance-build"))]
+mod api_key_acceptance;
 
 #[cfg(test)]
 mod tests {

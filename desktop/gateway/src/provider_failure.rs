@@ -1,12 +1,32 @@
 use std::fmt;
 
-use serde::Serialize;
+use serde::ser::SerializeStruct;
+use serde::{Serialize, Serializer};
 use serde_json::{json, Value};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ProviderId {
     Codex,
+    Deepseek,
+    Qwen,
+    Relay,
+    OpenaiCustom,
+    OpenaiResponses,
+}
+
+impl ProviderId {
+    pub(crate) fn from_adapter(adapter: &str) -> Option<Self> {
+        match adapter {
+            "codex" => Some(Self::Codex),
+            "deepseek" => Some(Self::Deepseek),
+            "qwen" => Some(Self::Qwen),
+            "relay" => Some(Self::Relay),
+            "openai-custom" => Some(Self::OpenaiCustom),
+            "openai-responses" => Some(Self::OpenaiResponses),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -14,6 +34,20 @@ pub(crate) enum ProviderId {
 pub(crate) enum RouteMode {
     Responses,
     ResponsesLite,
+    AnthropicMessages,
+    OpenaiChat,
+    OpenaiResponses,
+}
+
+impl RouteMode {
+    pub(crate) fn from_api_key_transport(transport: &str) -> Option<Self> {
+        match transport {
+            "anthropic_messages" => Some(Self::AnthropicMessages),
+            "openai_chat" => Some(Self::OpenaiChat),
+            "openai_responses" => Some(Self::OpenaiResponses),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -54,6 +88,13 @@ pub(crate) struct RetryPolicy {
     pub(crate) max_posts: u8,
     pub(crate) fallback_delays_ms: [u64; 2],
     pub(crate) retry_after_cap_seconds: u64,
+    retry_408: bool,
+    retry_409: bool,
+    retry_429: bool,
+    retry_5xx: bool,
+    retry_connect: bool,
+    retry_timeout: bool,
+    retry_unknown_429: bool,
 }
 
 impl RetryPolicy {
@@ -61,7 +102,63 @@ impl RetryPolicy {
         max_posts: 3,
         fallback_delays_ms: [500, 1_000],
         retry_after_cap_seconds: 60,
+        retry_408: true,
+        retry_409: true,
+        retry_429: true,
+        retry_5xx: true,
+        retry_connect: true,
+        retry_timeout: true,
+        retry_unknown_429: false,
     };
+
+    pub(crate) const ANTHROPIC_MESSAGES: Self = Self {
+        max_posts: 3,
+        fallback_delays_ms: [500, 1_000],
+        retry_after_cap_seconds: 60,
+        retry_408: true,
+        retry_409: false,
+        retry_429: true,
+        retry_5xx: true,
+        retry_connect: true,
+        retry_timeout: true,
+        retry_unknown_429: true,
+    };
+
+    pub(crate) const OPENAI_CHAT: Self = Self {
+        max_posts: 3,
+        fallback_delays_ms: [500, 1_000],
+        retry_after_cap_seconds: 60,
+        retry_408: true,
+        retry_409: true,
+        retry_429: true,
+        retry_5xx: true,
+        retry_connect: true,
+        retry_timeout: true,
+        retry_unknown_429: true,
+    };
+
+    pub(crate) const OPENAI_RESPONSES: Self = Self::OPENAI_CHAT;
+
+    pub(crate) fn allows(&self, observation: &FailureObservation) -> bool {
+        match observation {
+            FailureObservation::Http { status: 408, .. } => self.retry_408,
+            FailureObservation::Http { status: 409, .. } => self.retry_409,
+            FailureObservation::Http {
+                status: 429,
+                rate_kind,
+                ..
+            } => self.retry_429 && (rate_kind.is_some() || self.retry_unknown_429),
+            FailureObservation::Http {
+                status: 500..=599, ..
+            } => self.retry_5xx,
+            FailureObservation::Network(NetworkKind::Connect) => self.retry_connect,
+            FailureObservation::Network(NetworkKind::Timeout) => self.retry_timeout,
+            FailureObservation::Network(NetworkKind::Read) => *self == Self::CODEX,
+            FailureObservation::Http { .. }
+            | FailureObservation::Protocol(_)
+            | FailureObservation::Cancelled => false,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -81,6 +178,34 @@ impl RouteContext {
             retry_policy: RetryPolicy::CODEX,
         }
     }
+
+    // Introduced at the Task 1 interface boundary; production handlers consume it in later tasks.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn api_key(
+        provider: ProviderId,
+        route: RouteMode,
+        correlation_id: CorrelationId,
+        retry_policy: RetryPolicy,
+    ) -> Self {
+        assert!(
+            provider != ProviderId::Codex,
+            "API-key provider must be non-Codex"
+        );
+        assert!(
+            !matches!(route, RouteMode::Responses | RouteMode::ResponsesLite),
+            "API-key route must be non-Codex"
+        );
+        assert!(
+            retry_policy != RetryPolicy::CODEX,
+            "API-key retry policy must be non-Codex"
+        );
+        Self {
+            provider,
+            route,
+            correlation_id,
+            retry_policy,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -94,6 +219,7 @@ pub(crate) enum ErrorCode {
     Absent,
     UnsupportedValue,
     InsufficientQuota,
+    RateLimitError,
     RateLimitExceeded,
     Other,
 }
@@ -168,15 +294,27 @@ pub(crate) struct ProviderFailure {
     retry_after_seconds: Option<u64>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct AttemptDiagnostic {
-    outcome: AttemptOutcome,
+    schema_version: u8,
     provider: ProviderId,
     route: RouteMode,
     correlation_id: CorrelationId,
+    outcome: AttemptOutcome,
     posts: u8,
     repairs: u8,
+    reason: AttemptReason,
     delays_ms: Vec<u64>,
+    mapped_status: Option<u16>,
+    upstream_status: Option<u16>,
+    failure_class: Option<FailureClass>,
+    retryable: Option<bool>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub(crate) struct AttemptReason {
+    kind: AttemptReasonKind,
+    delay_count: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     mapped_status: Option<u16>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -185,6 +323,14 @@ pub(crate) struct AttemptDiagnostic {
     failure_class: Option<FailureClass>,
     #[serde(skip_serializing_if = "Option::is_none")]
     retryable: Option<bool>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum AttemptReasonKind {
+    Completed,
+    Failed,
+    Cancelled,
 }
 
 impl ProviderFailure {
@@ -266,7 +412,7 @@ impl ProviderFailure {
                 "rate_limit_error",
                 "Provider rate limit prevents this request",
                 FailureClass::RateLimit,
-                false,
+                exhausted,
                 "Wait for rate capacity before starting a new request",
             ),
             FailureObservation::Http { status: 408, .. } => (
@@ -277,9 +423,20 @@ impl ProviderFailure {
                 exhausted,
                 "Start a new request after the provider recovers",
             ),
+            FailureObservation::Http { status: 409, .. }
+                if context.retry_policy.allows(observation) =>
+            {
+                (
+                    502,
+                    "api_error",
+                    "Provider transient failure exhausted retry budget",
+                    FailureClass::Transient,
+                    exhausted,
+                    "Start a new request after the provider recovers",
+                )
+            }
             FailureObservation::Http {
-                status: 409 | 500..=599,
-                ..
+                status: 500..=599, ..
             } => (
                 502,
                 "api_error",
@@ -288,6 +445,22 @@ impl ProviderFailure {
                 exhausted,
                 "Start a new request after the provider recovers",
             ),
+            FailureObservation::Http { status, .. }
+                if (300..=399).contains(status)
+                    && matches!(
+                        context.route,
+                        RouteMode::OpenaiChat | RouteMode::OpenaiResponses
+                    ) =>
+            {
+                (
+                    *status,
+                    "api_error",
+                    "Provider returned a redirect",
+                    FailureClass::Protocol,
+                    false,
+                    "Use the configured provider endpoint directly before starting a new request",
+                )
+            }
             FailureObservation::Http { status, .. } if (400..=499).contains(status) => (
                 *status,
                 "invalid_request_error",
@@ -401,12 +574,25 @@ impl AttemptDiagnostic {
         snapshot: AttemptSnapshot,
     ) -> Self {
         Self {
-            outcome,
+            schema_version: 1,
             provider: context.provider,
             route: context.route,
             correlation_id: context.correlation_id.clone(),
+            outcome,
             posts: snapshot.posts,
             repairs: snapshot.repairs,
+            reason: AttemptReason {
+                kind: match outcome {
+                    AttemptOutcome::Completed => AttemptReasonKind::Completed,
+                    AttemptOutcome::Failed => AttemptReasonKind::Failed,
+                    AttemptOutcome::Cancelled => AttemptReasonKind::Cancelled,
+                },
+                delay_count: snapshot.delays_ms.len(),
+                mapped_status: None,
+                upstream_status: None,
+                failure_class: None,
+                retryable: None,
+            },
             delays_ms: snapshot.delays_ms,
             mapped_status: None,
             upstream_status: None,
@@ -423,17 +609,81 @@ impl AttemptDiagnostic {
         failure: &ProviderFailure,
     ) -> Self {
         Self {
-            outcome: AttemptOutcome::Failed,
+            schema_version: 1,
             provider: context.provider,
             route: context.route,
             correlation_id: context.correlation_id.clone(),
+            outcome: AttemptOutcome::Failed,
             posts,
             repairs,
+            reason: AttemptReason {
+                kind: AttemptReasonKind::Failed,
+                delay_count: delays_ms.len(),
+                mapped_status: Some(failure.status),
+                upstream_status: failure.upstream_status,
+                failure_class: Some(failure.failure_class),
+                retryable: Some(failure.retryable),
+            },
             delays_ms,
             mapped_status: Some(failure.status),
             upstream_status: failure.upstream_status,
             failure_class: Some(failure.failure_class),
             retryable: Some(failure.retryable),
+        }
+    }
+}
+
+impl Serialize for AttemptDiagnostic {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        if self.provider == ProviderId::Codex {
+            let mut fields = 7;
+            if self.mapped_status.is_some() {
+                fields += 1;
+            }
+            if self.upstream_status.is_some() {
+                fields += 1;
+            }
+            if self.failure_class.is_some() {
+                fields += 1;
+            }
+            if self.retryable.is_some() {
+                fields += 1;
+            }
+            let mut state = serializer.serialize_struct("AttemptDiagnostic", fields)?;
+            state.serialize_field("outcome", &self.outcome)?;
+            state.serialize_field("provider", &self.provider)?;
+            state.serialize_field("route", &self.route)?;
+            state.serialize_field("correlation_id", &self.correlation_id)?;
+            state.serialize_field("posts", &self.posts)?;
+            state.serialize_field("repairs", &self.repairs)?;
+            state.serialize_field("delays_ms", &self.delays_ms)?;
+            if let Some(mapped_status) = self.mapped_status {
+                state.serialize_field("mapped_status", &mapped_status)?;
+            }
+            if let Some(upstream_status) = self.upstream_status {
+                state.serialize_field("upstream_status", &upstream_status)?;
+            }
+            if let Some(failure_class) = self.failure_class {
+                state.serialize_field("failure_class", &failure_class)?;
+            }
+            if let Some(retryable) = self.retryable {
+                state.serialize_field("retryable", &retryable)?;
+            }
+            state.end()
+        } else {
+            let mut state = serializer.serialize_struct("AttemptDiagnostic", 8)?;
+            state.serialize_field("schema_version", &self.schema_version)?;
+            state.serialize_field("provider", &self.provider)?;
+            state.serialize_field("route", &self.route)?;
+            state.serialize_field("correlation_id", &self.correlation_id)?;
+            state.serialize_field("outcome", &self.outcome)?;
+            state.serialize_field("posts", &self.posts)?;
+            state.serialize_field("repairs", &self.repairs)?;
+            state.serialize_field("reason", &self.reason)?;
+            state.end()
         }
     }
 }
@@ -526,6 +776,18 @@ impl AttemptController {
             snapshot.delays_ms,
             failure,
         ))
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn internal_terminal_failure(&mut self) -> Result<(), TransitionError> {
+        if matches!(
+            self.phase,
+            AttemptPhase::TerminalPending(_) | AttemptPhase::Finalized(_)
+        ) {
+            return Err(TransitionError::ObservationNotAuthorized);
+        }
+        self.phase = AttemptPhase::TerminalPending(AttemptOutcome::Failed);
+        Ok(())
     }
 
     pub(crate) fn completed_diagnostic(&mut self) -> Result<AttemptDiagnostic, TransitionError> {
@@ -636,25 +898,18 @@ impl AttemptController {
             ));
         }
 
-        let proven_rate = matches!(
+        let quota = matches!(
             &observation,
             FailureObservation::Http {
                 status: 429,
-                rate_kind: Some(RateKind::RateLimit),
+                rate_kind: Some(RateKind::Quota),
                 ..
             }
         );
-        let transient_http = matches!(
-            &observation,
-            FailureObservation::Http {
-                status: 408 | 409 | 500..=599,
-                ..
-            }
-        );
-        let transient_network = matches!(&observation, FailureObservation::Network(_));
-        let can_retry = self.repairs == 0
-            && self.posts < self.context.retry_policy.max_posts
-            && (proven_rate || transient_http || transient_network);
+        let policy_allows = self.context.retry_policy.allows(&observation);
+        let retryable = !quota && policy_allows;
+        let can_retry =
+            self.repairs == 0 && self.posts < self.context.retry_policy.max_posts && retryable;
         if can_retry {
             let override_seconds = match &observation {
                 FailureObservation::Http {
@@ -675,7 +930,7 @@ impl AttemptController {
             return Ok(AttemptDirective::RetryAfter(delay_ms));
         }
 
-        let exhausted = proven_rate || transient_http || transient_network;
+        let exhausted = retryable;
         self.phase = AttemptPhase::TerminalPending(AttemptOutcome::Failed);
         Ok(AttemptDirective::Fail(ProviderFailure::from_observation(
             &self.context,
