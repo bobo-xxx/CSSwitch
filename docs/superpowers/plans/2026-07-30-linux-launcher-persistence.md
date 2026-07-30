@@ -441,7 +441,7 @@ Expected rollback hash: `87894fda3898a54c90ce3baa3c7efaea8e419d89fabbad37c22ffd9
 
 **Interfaces:**
 - Consumes: installed launcher hash `b7fa8c4598740c3bf351298a1902663c3f09be21dba5bc11dac6442f46c91c4e` and the pre-install Gateway/Science PID values.
-- Produces: plain launcher status at `auth=ready`, `gateway=running health=ready catalog=ready`, `science=running listener=ready`, plus a committed and pushed sanitized verification record.
+- Produces: plain launcher status at `auth=ready`, `gateway=running health=ready catalog=ready`, `science=running listener=ready`, plus a committed sanitized verification record ready for the reviewed-branch integration handoff.
 
 - [ ] **Step 1: Run the installed and portable launcher test gates**
 
