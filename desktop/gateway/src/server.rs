@@ -1604,7 +1604,7 @@ impl AttemptRuntime for ProductionProviderAttemptRuntime {
             if api_key_acceptance::cancel_recorded_wait() {
                 return false;
             }
-            return !self.cancelled();
+            !self.cancelled()
         }
         #[cfg(not(all(test, feature = "acceptance-build")))]
         {
