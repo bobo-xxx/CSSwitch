@@ -701,8 +701,13 @@ impl<'a> FailureJsonScanner<'a> {
         }
         let quota = kind == Some(FailureBodyToken::InsufficientQuota)
             || code == Some(FailureBodyToken::InsufficientQuota);
-        let rate = kind == Some(FailureBodyToken::RateLimitError)
-            || code == Some(FailureBodyToken::RateLimitExceeded);
+        let rate = matches!(
+            kind,
+            Some(FailureBodyToken::RateLimitError | FailureBodyToken::RateLimitExceeded)
+        ) || matches!(
+            code,
+            Some(FailureBodyToken::RateLimitError | FailureBodyToken::RateLimitExceeded)
+        );
         Some((
             if quota {
                 Some(RateKind::Quota)
@@ -714,12 +719,15 @@ impl<'a> FailureJsonScanner<'a> {
             match code {
                 Some(FailureBodyToken::InsufficientQuota) => ErrorCode::InsufficientQuota,
                 Some(FailureBodyToken::RateLimitExceeded) => ErrorCode::RateLimitExceeded,
-                Some(FailureBodyToken::RateLimitError) | Some(FailureBodyToken::Other) => {
-                    ErrorCode::Other
-                }
+                Some(FailureBodyToken::RateLimitError) => ErrorCode::RateLimitError,
+                Some(FailureBodyToken::Other) => ErrorCode::Other,
                 None if kind == Some(FailureBodyToken::InsufficientQuota) => {
                     ErrorCode::InsufficientQuota
                 }
+                None if kind == Some(FailureBodyToken::RateLimitExceeded) => {
+                    ErrorCode::RateLimitExceeded
+                }
+                None if kind == Some(FailureBodyToken::RateLimitError) => ErrorCode::RateLimitError,
                 None => ErrorCode::Absent,
             },
         ))
@@ -1597,6 +1605,36 @@ mod tests {
 
     #[test]
     fn failure_projection_bounds_body_and_validates_retry_headers() {
+        let cases = [
+            (
+                br#"{"error":{"code":"insufficient_quota"}}"#.as_slice(),
+                (Some(RateKind::Quota), ErrorCode::InsufficientQuota),
+            ),
+            (
+                br#"{"error":{"type":"insufficient_quota"}}"#.as_slice(),
+                (Some(RateKind::Quota), ErrorCode::InsufficientQuota),
+            ),
+            (
+                br#"{"error":{"code":"rate_limit_exceeded"}}"#.as_slice(),
+                (Some(RateKind::RateLimit), ErrorCode::RateLimitExceeded),
+            ),
+            (
+                br#"{"error":{"type":"rate_limit_exceeded"}}"#.as_slice(),
+                (Some(RateKind::RateLimit), ErrorCode::RateLimitExceeded),
+            ),
+            (
+                br#"{"error":{"code":"rate_limit_error"}}"#.as_slice(),
+                (Some(RateKind::RateLimit), ErrorCode::RateLimitError),
+            ),
+            (
+                br#"{"error":{"type":"rate_limit_error"}}"#.as_slice(),
+                (Some(RateKind::RateLimit), ErrorCode::RateLimitError),
+            ),
+        ];
+        for (body, expected) in cases {
+            assert_eq!(project_api_failure_body(body), expected);
+        }
+
         let oversized = oversized_error_body_with_late_insufficient_quota();
         assert_eq!(
             project_api_failure_body(&oversized),

@@ -218,6 +218,7 @@ pub(crate) enum ErrorCode {
     Absent,
     UnsupportedValue,
     InsufficientQuota,
+    RateLimitError,
     RateLimitExceeded,
     Other,
 }
