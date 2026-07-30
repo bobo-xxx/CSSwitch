@@ -4,10 +4,14 @@ use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
 use reqwest::blocking::{Client, Response};
+use reqwest::header::{HeaderMap, CONTENT_TYPE};
 use serde_json::Value;
 
 use crate::config::{GatewayConfig, UPSTREAM_UA};
 use crate::provider_contracts::AuthScheme;
+use crate::provider_failure::{
+    ErrorCode, ErrorParam, FailureObservation, NetworkKind, ProtocolKind, RateKind, RequestId,
+};
 
 #[derive(Debug)]
 pub struct UpstreamBody {
@@ -26,6 +30,21 @@ pub struct UpstreamError {
 #[derive(Debug)]
 pub struct UpstreamStream {
     pub response: Response,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AttemptMode {
+    Nonstream,
+    Stream,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug)]
+pub(crate) struct OpenedInferenceResponse {
+    response: Response,
+    started: Instant,
+    timeouts: InferenceTimeouts,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -191,12 +210,12 @@ fn models_client(timeouts: ModelsTimeouts) -> Result<Client, UpstreamError> {
         })
 }
 
-fn post_with_timeouts(
+fn build_inference_request(
     cfg: &GatewayConfig,
     body: Vec<u8>,
     timeouts: InferenceTimeouts,
     enforce_total: bool,
-) -> Result<Response, UpstreamError> {
+) -> Result<reqwest::blocking::RequestBuilder, UpstreamError> {
     let api_key = cfg.api_key.as_deref().unwrap_or("");
     let request = inference_client(timeouts, enforce_total)?
         .post(&cfg.upstream_url)
@@ -214,11 +233,22 @@ fn post_with_timeouts(
         // Codex requests use codex_transport and never reach this generic API-key path.
         AuthScheme::CsswitchOauth => request,
     };
-    request.body(body).send().map_err(|e| UpstreamError {
-        status: 502,
-        upstream_status: None,
-        detail: e.to_string(),
-    })
+    Ok(request.body(body))
+}
+
+fn post_with_timeouts(
+    cfg: &GatewayConfig,
+    body: Vec<u8>,
+    timeouts: InferenceTimeouts,
+    enforce_total: bool,
+) -> Result<Response, UpstreamError> {
+    build_inference_request(cfg, body, timeouts, enforce_total)?
+        .send()
+        .map_err(|e| UpstreamError {
+            status: 502,
+            upstream_status: None,
+            detail: e.to_string(),
+        })
 }
 
 fn inference_timeouts(cfg: &GatewayConfig) -> InferenceTimeouts {
@@ -458,6 +488,565 @@ fn map_http_error(
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
+const FAILURE_JSON_MAX_DEPTH: usize = 16;
+#[cfg_attr(not(test), allow(dead_code))]
+const FAILURE_JSON_MAX_FIELDS: usize = 128;
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Copy)]
+struct JsonString<'a> {
+    raw: &'a [u8],
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl JsonString<'_> {
+    fn equals_ascii(self, expected: &[u8]) -> bool {
+        let mut raw_offset = 0;
+        let mut expected_offset = 0;
+        while raw_offset < self.raw.len() {
+            let (decoded, consumed) = if self.raw[raw_offset] == b'\\' {
+                let Some(escaped) = self.raw.get(raw_offset + 1).copied() else {
+                    return false;
+                };
+                match escaped {
+                    b'"' | b'\\' | b'/' => (u32::from(escaped), 2),
+                    b'b' => (u32::from(b'\x08'), 2),
+                    b'f' => (u32::from(b'\x0c'), 2),
+                    b'n' => (u32::from(b'\n'), 2),
+                    b'r' => (u32::from(b'\r'), 2),
+                    b't' => (u32::from(b'\t'), 2),
+                    b'u' => {
+                        let Some(high) = parse_hex_quad(self.raw, raw_offset + 2) else {
+                            return false;
+                        };
+                        if (0xd800..=0xdbff).contains(&high) {
+                            if self.raw.get(raw_offset + 6..raw_offset + 8) != Some(b"\\u") {
+                                return false;
+                            }
+                            let Some(low) = parse_hex_quad(self.raw, raw_offset + 8) else {
+                                return false;
+                            };
+                            if !(0xdc00..=0xdfff).contains(&low) {
+                                return false;
+                            }
+                            let scalar = 0x1_0000
+                                + ((u32::from(high) - 0xd800) << 10)
+                                + (u32::from(low) - 0xdc00);
+                            (scalar, 12)
+                        } else {
+                            (u32::from(high), 6)
+                        }
+                    }
+                    _ => return false,
+                }
+            } else if self.raw[raw_offset].is_ascii() {
+                (u32::from(self.raw[raw_offset]), 1)
+            } else {
+                let Ok(suffix) = std::str::from_utf8(&self.raw[raw_offset..]) else {
+                    return false;
+                };
+                let Some(character) = suffix.chars().next() else {
+                    return false;
+                };
+                (character as u32, character.len_utf8())
+            };
+            if expected.get(expected_offset).copied().map(u32::from) != Some(decoded) {
+                return false;
+            }
+            raw_offset += consumed;
+            expected_offset += 1;
+        }
+        expected_offset == expected.len()
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn parse_hex_quad(input: &[u8], start: usize) -> Option<u16> {
+    let digits = input.get(start..start + 4)?;
+    digits.iter().try_fold(0_u16, |value, digit| {
+        let digit = match digit {
+            b'0'..=b'9' => u16::from(*digit - b'0'),
+            b'a'..=b'f' => u16::from(*digit - b'a' + 10),
+            b'A'..=b'F' => u16::from(*digit - b'A' + 10),
+            _ => return None,
+        };
+        value.checked_mul(16)?.checked_add(digit)
+    })
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FailureBodyToken {
+    InsufficientQuota,
+    RateLimitError,
+    RateLimitExceeded,
+    Other,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl FailureBodyToken {
+    fn from_json_string(value: JsonString<'_>) -> Self {
+        if value.equals_ascii(b"insufficient_quota") {
+            Self::InsufficientQuota
+        } else if value.equals_ascii(b"rate_limit_error") {
+            Self::RateLimitError
+        } else if value.equals_ascii(b"rate_limit_exceeded") {
+            Self::RateLimitExceeded
+        } else {
+            Self::Other
+        }
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+struct FailureJsonScanner<'a> {
+    input: &'a [u8],
+    cursor: usize,
+    fields: usize,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl<'a> FailureJsonScanner<'a> {
+    fn new(input: &'a [u8]) -> Self {
+        Self {
+            input,
+            cursor: 0,
+            fields: 0,
+        }
+    }
+
+    fn project(mut self) -> Option<(Option<RateKind>, ErrorCode)> {
+        self.skip_whitespace();
+        let facts = self.parse_root_object(1)?;
+        self.skip_whitespace();
+        (self.cursor == self.input.len()).then_some(facts)
+    }
+
+    fn parse_root_object(&mut self, depth: usize) -> Option<(Option<RateKind>, ErrorCode)> {
+        self.require_depth(depth)?;
+        self.expect(b'{')?;
+        self.skip_whitespace();
+        if self.consume(b'}') {
+            return Some((None, ErrorCode::Absent));
+        }
+        let mut facts = (None, ErrorCode::Absent);
+        let mut saw_error = false;
+        loop {
+            self.record_field()?;
+            let key = self.parse_string()?;
+            self.skip_whitespace();
+            self.expect(b':')?;
+            self.skip_whitespace();
+            if key.equals_ascii(b"error") {
+                if saw_error {
+                    return None;
+                }
+                saw_error = true;
+                facts = self.parse_error_value(depth + 1)?;
+            } else {
+                self.skip_value(depth + 1)?;
+            }
+            self.skip_whitespace();
+            if self.consume(b'}') {
+                return Some(facts);
+            }
+            self.expect(b',')?;
+            self.skip_whitespace();
+        }
+    }
+
+    fn parse_error_value(&mut self, depth: usize) -> Option<(Option<RateKind>, ErrorCode)> {
+        if self.peek() != Some(b'{') {
+            self.skip_value(depth)?;
+            return Some((None, ErrorCode::Absent));
+        }
+        self.require_depth(depth)?;
+        self.expect(b'{')?;
+        self.skip_whitespace();
+        if self.consume(b'}') {
+            return Some((None, ErrorCode::Absent));
+        }
+        let mut kind = None;
+        let mut code = None;
+        let mut saw_kind = false;
+        let mut saw_code = false;
+        loop {
+            self.record_field()?;
+            let key = self.parse_string()?;
+            self.skip_whitespace();
+            self.expect(b':')?;
+            self.skip_whitespace();
+            if key.equals_ascii(b"type") {
+                if saw_kind {
+                    return None;
+                }
+                saw_kind = true;
+                kind = self.parse_optional_token()?;
+            } else if key.equals_ascii(b"code") {
+                if saw_code {
+                    return None;
+                }
+                saw_code = true;
+                code = self.parse_optional_token()?;
+            } else {
+                self.skip_value(depth + 1)?;
+            }
+            self.skip_whitespace();
+            if self.consume(b'}') {
+                break;
+            }
+            self.expect(b',')?;
+            self.skip_whitespace();
+        }
+        let quota = kind == Some(FailureBodyToken::InsufficientQuota)
+            || code == Some(FailureBodyToken::InsufficientQuota);
+        let rate = kind == Some(FailureBodyToken::RateLimitError)
+            || code == Some(FailureBodyToken::RateLimitExceeded);
+        Some((
+            if quota {
+                Some(RateKind::Quota)
+            } else if rate {
+                Some(RateKind::RateLimit)
+            } else {
+                None
+            },
+            match code {
+                Some(FailureBodyToken::InsufficientQuota) => ErrorCode::InsufficientQuota,
+                Some(FailureBodyToken::RateLimitExceeded) => ErrorCode::RateLimitExceeded,
+                Some(FailureBodyToken::RateLimitError) | Some(FailureBodyToken::Other) => {
+                    ErrorCode::Other
+                }
+                None if kind == Some(FailureBodyToken::InsufficientQuota) => {
+                    ErrorCode::InsufficientQuota
+                }
+                None => ErrorCode::Absent,
+            },
+        ))
+    }
+
+    fn parse_optional_token(&mut self) -> Option<Option<FailureBodyToken>> {
+        if self.peek() == Some(b'"') {
+            return Some(Some(FailureBodyToken::from_json_string(
+                self.parse_string()?,
+            )));
+        }
+        self.consume_literal(b"null").then_some(None)
+    }
+
+    fn skip_value(&mut self, depth: usize) -> Option<()> {
+        self.skip_whitespace();
+        match self.peek()? {
+            b'{' => self.skip_object(depth),
+            b'[' => self.skip_array(depth),
+            b'"' => self.parse_string().map(|_| ()),
+            b't' => self.consume_literal(b"true").then_some(()),
+            b'f' => self.consume_literal(b"false").then_some(()),
+            b'n' => self.consume_literal(b"null").then_some(()),
+            b'-' | b'0'..=b'9' => self.skip_number(),
+            _ => None,
+        }
+    }
+
+    fn skip_object(&mut self, depth: usize) -> Option<()> {
+        self.require_depth(depth)?;
+        self.expect(b'{')?;
+        self.skip_whitespace();
+        if self.consume(b'}') {
+            return Some(());
+        }
+        loop {
+            self.record_field()?;
+            self.parse_string()?;
+            self.skip_whitespace();
+            self.expect(b':')?;
+            self.skip_whitespace();
+            self.skip_value(depth + 1)?;
+            self.skip_whitespace();
+            if self.consume(b'}') {
+                return Some(());
+            }
+            self.expect(b',')?;
+            self.skip_whitespace();
+        }
+    }
+
+    fn skip_array(&mut self, depth: usize) -> Option<()> {
+        self.require_depth(depth)?;
+        self.expect(b'[')?;
+        self.skip_whitespace();
+        if self.consume(b']') {
+            return Some(());
+        }
+        loop {
+            self.skip_value(depth + 1)?;
+            self.skip_whitespace();
+            if self.consume(b']') {
+                return Some(());
+            }
+            self.expect(b',')?;
+            self.skip_whitespace();
+        }
+    }
+
+    fn skip_number(&mut self) -> Option<()> {
+        let start = self.cursor;
+        self.consume(b'-');
+        match self.peek()? {
+            b'0' => {
+                self.cursor += 1;
+            }
+            b'1'..=b'9' => {
+                self.cursor += 1;
+                while matches!(self.peek(), Some(b'0'..=b'9')) {
+                    self.cursor += 1;
+                }
+            }
+            _ => return None,
+        }
+        if self.consume(b'.') {
+            let mut digits = 0;
+            while matches!(self.peek(), Some(b'0'..=b'9')) {
+                self.cursor += 1;
+                digits += 1;
+            }
+            if digits == 0 {
+                return None;
+            }
+        }
+        if matches!(self.peek(), Some(b'e' | b'E')) {
+            self.cursor += 1;
+            if matches!(self.peek(), Some(b'+' | b'-')) {
+                self.cursor += 1;
+            }
+            let mut digits = 0;
+            while matches!(self.peek(), Some(b'0'..=b'9')) {
+                self.cursor += 1;
+                digits += 1;
+            }
+            if digits == 0 {
+                return None;
+            }
+        }
+        (self.cursor > start).then_some(())
+    }
+
+    fn parse_string(&mut self) -> Option<JsonString<'a>> {
+        self.expect(b'"')?;
+        let start = self.cursor;
+        loop {
+            let byte = *self.input.get(self.cursor)?;
+            match byte {
+                b'"' => {
+                    let raw = &self.input[start..self.cursor];
+                    self.cursor += 1;
+                    return Some(JsonString { raw });
+                }
+                b'\\' => {
+                    self.cursor += 1;
+                    let escaped = *self.input.get(self.cursor)?;
+                    match escaped {
+                        b'"' | b'\\' | b'/' | b'b' | b'f' | b'n' | b'r' | b't' => {
+                            self.cursor += 1;
+                        }
+                        b'u' => {
+                            self.cursor += 5;
+                            self.input.get(self.cursor - 4..self.cursor)?;
+                        }
+                        _ => return None,
+                    }
+                }
+                0x00..=0x1f => return None,
+                _ => self.cursor += 1,
+            }
+        }
+    }
+
+    fn record_field(&mut self) -> Option<()> {
+        self.fields += 1;
+        (self.fields <= FAILURE_JSON_MAX_FIELDS).then_some(())
+    }
+
+    fn require_depth(&self, depth: usize) -> Option<()> {
+        (depth <= FAILURE_JSON_MAX_DEPTH).then_some(())
+    }
+
+    fn skip_whitespace(&mut self) {
+        while matches!(self.peek(), Some(b' ' | b'\n' | b'\r' | b'\t')) {
+            self.cursor += 1;
+        }
+    }
+
+    fn expect(&mut self, expected: u8) -> Option<()> {
+        (self.peek()? == expected).then(|| {
+            self.cursor += 1;
+        })
+    }
+
+    fn consume(&mut self, expected: u8) -> bool {
+        if self.peek() == Some(expected) {
+            self.cursor += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn consume_literal(&mut self, literal: &[u8]) -> bool {
+        if self.input.get(self.cursor..self.cursor + literal.len()) == Some(literal) {
+            self.cursor += literal.len();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn peek(&self) -> Option<u8> {
+        self.input.get(self.cursor).copied()
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn parse_retry_after(value: Option<&str>) -> Option<u64> {
+    let value = value?;
+    (!value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()))
+        .then(|| value.parse().ok())
+        .flatten()
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn parse_request_id(headers: &HeaderMap) -> Option<RequestId> {
+    headers
+        .get("x-request-id")
+        .and_then(|value| value.to_str().ok())
+        .and_then(RequestId::new)
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn project_api_failure_body(bytes: &[u8]) -> (Option<RateKind>, ErrorCode) {
+    if bytes.len() > MAX_ERROR_BODY_BYTES as usize {
+        return (None, ErrorCode::Absent);
+    }
+    FailureJsonScanner::new(bytes)
+        .project()
+        .unwrap_or((None, ErrorCode::Absent))
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn project_http_failure(
+    response: Response,
+    started: Instant,
+    total: Duration,
+) -> FailureObservation {
+    let status = response.status().as_u16();
+    let retry_after_seconds = parse_retry_after(
+        response
+            .headers()
+            .get("retry-after")
+            .and_then(|value| value.to_str().ok()),
+    );
+    let request_id = parse_request_id(response.headers());
+    let (rate_kind, error_code) =
+        match read_body_with_deadline(response, Some(MAX_ERROR_BODY_BYTES + 1), started, total) {
+            Ok(bytes) => {
+                let admitted = bytes.len().min(MAX_ERROR_BODY_BYTES as usize);
+                let _ = serde_json::from_slice::<Value>(&bytes[..admitted]);
+                project_api_failure_body(&bytes[..admitted])
+            }
+            Err(_) => (None, ErrorCode::Absent),
+        };
+    FailureObservation::Http {
+        status,
+        rate_kind,
+        retry_after_seconds,
+        request_id,
+        error_code,
+        error_param: ErrorParam::Absent,
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn send_once(
+    cfg: &GatewayConfig,
+    body: &[u8],
+    mode: AttemptMode,
+    timeouts: InferenceTimeouts,
+) -> Result<Response, FailureObservation> {
+    let enforce_total = matches!(mode, AttemptMode::Nonstream);
+    build_inference_request(cfg, body.to_vec(), timeouts, enforce_total)
+        .map_err(|_| FailureObservation::Network(NetworkKind::Connect))?
+        .send()
+        .map_err(|error| {
+            if error.is_timeout() {
+                FailureObservation::Network(NetworkKind::Timeout)
+            } else if error.is_connect() {
+                FailureObservation::Network(NetworkKind::Connect)
+            } else {
+                FailureObservation::Network(NetworkKind::Read)
+            }
+        })
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn post_once(
+    cfg: &GatewayConfig,
+    body: &[u8],
+    mode: AttemptMode,
+) -> Result<OpenedInferenceResponse, FailureObservation> {
+    let timeouts = inference_timeouts(cfg);
+    let started = Instant::now();
+    let response = send_once(cfg, body, mode, timeouts)?;
+    if response.status().is_success() {
+        Ok(OpenedInferenceResponse {
+            response,
+            started,
+            timeouts,
+        })
+    } else {
+        Err(project_http_failure(response, started, timeouts.total))
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl OpenedInferenceResponse {
+    pub(crate) fn into_nonstream(self) -> Result<UpstreamBody, FailureObservation> {
+        let status = self.response.status().as_u16();
+        let content_type = self
+            .response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("application/json")
+            .to_string();
+        let body = read_body_with_deadline(self.response, None, self.started, self.timeouts.total)
+            .map_err(|_| FailureObservation::Network(NetworkKind::Read))?;
+        Ok(UpstreamBody {
+            status,
+            content_type,
+            body,
+        })
+    }
+
+    pub(crate) fn into_stream(self) -> Result<UpstreamStream, FailureObservation> {
+        let content_type = self
+            .response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default();
+        if !content_type
+            .split(';')
+            .next()
+            .is_some_and(|value| value.trim().eq_ignore_ascii_case("text/event-stream"))
+        {
+            return Err(FailureObservation::Protocol(ProtocolKind::InvalidResponse));
+        }
+        Ok(UpstreamStream {
+            response: self.response,
+        })
+    }
+}
+
 pub fn post_nonstream(cfg: &GatewayConfig, body: Vec<u8>) -> Result<UpstreamBody, UpstreamError> {
     let timeouts = inference_timeouts(cfg);
     let started = Instant::now();
@@ -470,31 +1059,23 @@ pub fn post_nonstream(cfg: &GatewayConfig, body: Vec<u8>) -> Result<UpstreamBody
             timeouts.total,
         ));
     }
-    let status = resp.status().as_u16();
-    let content_type = resp
-        .headers()
-        .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("application/json")
-        .to_string();
-    let response_body =
-        read_body_with_deadline(resp, None, started, timeouts.total).map_err(|error| {
-            let detail = match error {
-                BodyReadFailure::Deadline => "upstream response exceeded the total timeout".into(),
-                BodyReadFailure::Io(error) => {
-                    format!("upstream response body read failed: {error}")
-                }
-            };
-            UpstreamError {
-                status: 502,
-                upstream_status: Some(status),
-                detail,
-            }
-        })?;
-    Ok(UpstreamBody {
-        status,
-        content_type,
-        body: response_body,
+    OpenedInferenceResponse {
+        response: resp,
+        started,
+        timeouts,
+    }
+    .into_nonstream()
+    .map_err(|observation| match observation {
+        FailureObservation::Network(NetworkKind::Read) => UpstreamError {
+            status: 502,
+            upstream_status: Some(200),
+            detail: "upstream response body read failed".into(),
+        },
+        _ => UpstreamError {
+            status: 502,
+            upstream_status: None,
+            detail: "upstream request failed".into(),
+        },
     })
 }
 
@@ -533,7 +1114,25 @@ fn read_first_line(resp: &mut Response) -> Result<Vec<u8>, UpstreamError> {
 pub fn open_stream(cfg: &GatewayConfig, body: Vec<u8>) -> Result<UpstreamStream, UpstreamError> {
     let timeouts = inference_timeouts(cfg);
     let started = Instant::now();
-    let resp = post_with_timeouts(cfg, body, timeouts, false)?;
+    let resp = send_once(cfg, &body, AttemptMode::Stream, timeouts).map_err(|observation| {
+        let detail = match observation {
+            FailureObservation::Network(NetworkKind::Timeout) => {
+                "upstream request timed out".into()
+            }
+            FailureObservation::Network(NetworkKind::Connect) => {
+                "upstream connection failed".into()
+            }
+            FailureObservation::Network(NetworkKind::Read) => "upstream request failed".into(),
+            FailureObservation::Http { .. }
+            | FailureObservation::Protocol(_)
+            | FailureObservation::Cancelled => "upstream request failed".into(),
+        };
+        UpstreamError {
+            status: 502,
+            upstream_status: None,
+            detail,
+        }
+    })?;
     if !resp.status().is_success() {
         return Err(map_http_error(
             resp,
@@ -543,23 +1142,24 @@ pub fn open_stream(cfg: &GatewayConfig, body: Vec<u8>) -> Result<UpstreamStream,
         ));
     }
     let status = resp.status().as_u16();
-    let content_type = resp
-        .headers()
-        .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or_default();
-    if !content_type
-        .split(';')
-        .next()
-        .is_some_and(|value| value.trim().eq_ignore_ascii_case("text/event-stream"))
-    {
-        return Err(UpstreamError {
+    OpenedInferenceResponse {
+        response: resp,
+        started,
+        timeouts,
+    }
+    .into_stream()
+    .map_err(|observation| match observation {
+        FailureObservation::Protocol(ProtocolKind::InvalidResponse) => UpstreamError {
             status: 502,
             upstream_status: Some(status),
             detail: "upstream 200 returned a non-SSE Content-Type".into(),
-        });
-    }
-    Ok(UpstreamStream { response: resp })
+        },
+        _ => UpstreamError {
+            status: 502,
+            upstream_status: None,
+            detail: "upstream request failed".into(),
+        },
+    })
 }
 
 #[cfg(test)]
@@ -572,11 +1172,15 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{
-        models_timeout_secs, models_timeouts, post_with_timeouts, read_body_with_deadline,
-        read_first_line, redact_error_body, BodyReadFailure, InferenceTimeouts, ModelsTimeouts,
-        INFERENCE_TIMEOUTS,
+        models_timeout_secs, models_timeouts, parse_retry_after, post_with_timeouts,
+        project_api_failure_body, read_body_with_deadline, read_first_line, redact_error_body,
+        AttemptMode, BodyReadFailure, InferenceTimeouts, ModelsTimeouts, INFERENCE_TIMEOUTS,
+        MAX_ERROR_BODY_BYTES,
     };
     use crate::config::GatewayConfig;
+    use crate::provider_failure::{
+        ErrorCode, ErrorParam, FailureObservation, NetworkKind, RateKind, RequestId,
+    };
 
     fn bind_loopback() -> TcpListener {
         loop {
@@ -673,6 +1277,43 @@ mod tests {
             }
         });
         (format!("http://{address}/v1/messages"), count, handle)
+    }
+
+    fn response_with_headers(status: u16, body: &[u8], headers: &[(&str, &str)]) -> Vec<u8> {
+        let mut head = format!(
+            "HTTP/1.1 {status} fixture\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n",
+            body.len()
+        );
+        for (name, value) in headers {
+            head.push_str(name);
+            head.push_str(": ");
+            head.push_str(value);
+            head.push_str("\r\n");
+        }
+        head.push_str("\r\n");
+        let mut response = head.into_bytes();
+        response.extend_from_slice(body);
+        response
+    }
+
+    fn response_with_declared_length(
+        status: u16,
+        content_type: &str,
+        declared_len: usize,
+        body: &[u8],
+    ) -> Vec<u8> {
+        let mut response = format!(
+            "HTTP/1.1 {status} fixture\r\nContent-Type: {content_type}\r\nContent-Length: {declared_len}\r\nConnection: close\r\n\r\n"
+        )
+        .into_bytes();
+        response.extend_from_slice(body);
+        response
+    }
+
+    fn oversized_error_body_with_late_insufficient_quota() -> Vec<u8> {
+        let mut body = vec![b' '; MAX_ERROR_BODY_BYTES as usize + 1];
+        body.extend_from_slice(br#"{"error":{"code":"insufficient_quota"}}"#);
+        body
     }
 
     fn spawn_redirect_response() -> (String, Arc<AtomicUsize>, thread::JoinHandle<()>) {
@@ -910,6 +1551,64 @@ mod tests {
         assert!(error.detail.contains("truncated"));
         upstream.join().unwrap();
         assert_eq!(count.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn api_key_post_once_projects_only_closed_failure_facts() {
+        let body = br#"{"error":{"code":"insufficient_quota","message":"secret upstream text"}}"#;
+        let response = response_with_headers(
+            429,
+            body,
+            &[("Retry-After", "90"), ("x-request-id", "Req_01.a:b-c")],
+        );
+        let (url, count, upstream) = spawn_counted_response(response);
+        let observation = super::post_once(&test_config(url), b"{}", AttemptMode::Nonstream)
+            .expect_err("429 is a closed observation");
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            observation,
+            FailureObservation::Http {
+                status: 429,
+                rate_kind: Some(RateKind::Quota),
+                retry_after_seconds: Some(90),
+                request_id: RequestId::new("Req_01.a:b-c"),
+                error_code: ErrorCode::InsufficientQuota,
+                error_param: ErrorParam::Absent,
+            }
+        );
+        assert!(!format!("{observation:?}").contains("secret upstream text"));
+        upstream.join().unwrap();
+    }
+
+    #[test]
+    fn successful_headers_open_before_body_or_protocol_failure() {
+        let incomplete = response_with_declared_length(200, "application/json", 100, b"{}");
+        let (url, count, upstream) = spawn_counted_response(incomplete);
+        let opened = super::post_once(&test_config(url), b"{}", AttemptMode::Nonstream)
+            .expect("2xx response opens");
+        let observation = opened.into_nonstream().unwrap_err();
+        assert!(matches!(
+            observation,
+            FailureObservation::Network(NetworkKind::Read)
+        ));
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        upstream.join().unwrap();
+    }
+
+    #[test]
+    fn failure_projection_bounds_body_and_validates_retry_headers() {
+        let oversized = oversized_error_body_with_late_insufficient_quota();
+        assert_eq!(
+            project_api_failure_body(&oversized),
+            (None, ErrorCode::Absent)
+        );
+        assert_eq!(parse_retry_after(Some("60")), Some(60));
+        assert_eq!(parse_retry_after(Some(" 7 ")), None);
+        assert_eq!(
+            parse_retry_after(Some("Wed, 30 Jul 2026 00:00:00 GMT")),
+            None
+        );
+        assert!(RequestId::new("bad/request").is_none());
     }
 
     #[test]
