@@ -195,7 +195,7 @@ fn openai_conflict_retries_three_identical_posts_but_anthropic_stops_at_one() {
         &mut RecordingRuntime::default(),
     );
     assert!(matches!(result, OpenResult::Failed(_)));
-    assert_eq!(anthropic.bodies(), &[body.clone()]);
+    assert_eq!(anthropic.bodies(), std::slice::from_ref(&body));
 }
 
 #[test]

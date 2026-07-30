@@ -144,7 +144,11 @@ impl ApiKeyAttemptSequence {
                         });
                     }
                     AttemptDirective::RepairOnce(_) => {
-                        debug_assert!(cfg!(test), "API-key attempt sequence never enables repair");
+                        debug_assert!(
+                            std::env::var_os("CSSWITCH_API_KEY_REPAIR_UNREACHABLE_SENTINEL")
+                                .is_none(),
+                            "API-key attempt sequence never enables repair"
+                        );
                         controller
                             .internal_terminal_failure()
                             .expect("unexpected API-key repair becomes terminal failure");
@@ -167,6 +171,11 @@ impl ApiKeyAttemptSequence {
 }
 
 impl<O> OpenedAttempt<O> {
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn into_parts(self) -> (O, AttemptController) {
+        (self.opened, self.controller)
+    }
+
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn fail_after_open(mut self, observation: FailureObservation) -> TerminalAttempt {
         let directive = self
