@@ -88,11 +88,13 @@ enum FixtureRoute {
     GeminiChat,
     GrokChat,
     OpenCodeGoChat,
+    OpenaiResponses,
 }
 
 #[derive(Clone, Copy, Debug)]
 enum OpenedFixture {
     MalformedJson,
+    IncompleteBody,
     PartialSseThenClose,
 }
 
@@ -321,6 +323,7 @@ impl ScriptedUpstream {
             | FixtureRoute::GeminiChat
             | FixtureRoute::GrokChat
             | FixtureRoute::OpenCodeGoChat => "/v1/chat/completions",
+            FixtureRoute::OpenaiResponses => "/responses",
         };
         format!("http://{}{}", self.address, path)
     }
@@ -604,6 +607,12 @@ fn config(route: FixtureRoute, upstream_url: String) -> GatewayConfig {
             "opencode-go-chat",
             None,
         ),
+        FixtureRoute::OpenaiResponses => (
+            "openai-responses",
+            "custom-openai-responses",
+            "openai-responses-model",
+            None,
+        ),
     };
     let digest = provider_contract_catalog_digest();
     let contract =
@@ -678,7 +687,10 @@ fn run_with_downstream(
             &cfg,
             serde_json::to_vec(&request(
                 mode,
-                matches!(route, FixtureRoute::DeepseekAnthropic),
+                matches!(
+                    route,
+                    FixtureRoute::DeepseekAnthropic | FixtureRoute::OpenaiResponses
+                ),
             ))
             .expect("serialize caller request"),
             Some(&request_nonces),
@@ -721,6 +733,7 @@ fn request_id_sentinel(route: FixtureRoute) -> &'static str {
         | FixtureRoute::GeminiChat
         | FixtureRoute::GrokChat
         | FixtureRoute::OpenCodeGoChat => "Req-secret-03",
+        FixtureRoute::OpenaiResponses => "Req-secret-04",
     }
 }
 
@@ -799,6 +812,26 @@ fn assert_script(route: FixtureRoute, result: &AcceptanceResult, expected_posts:
                 assert_eq!(body["messages"][0]["role"], "user");
                 assert_eq!(body["messages"][0]["content"], "hello");
             }
+            FixtureRoute::OpenaiResponses => {
+                assert_eq!(request.path, "/responses");
+                assert!(
+                    !request.headers.contains_key("x-api-key"),
+                    "OpenAI Responses bearer auth must not add x-api-key"
+                );
+                assert_eq!(
+                    request.headers.get("authorization").map(String::as_str),
+                    Some("Bearer fixture-api-key"),
+                    "OpenAI Responses routes must send synthetic bearer"
+                );
+                let body: Value =
+                    serde_json::from_slice(&request.body).expect("OpenAI Responses request JSON");
+                assert_eq!(body["model"], expected_upstream_model(route));
+                assert_eq!(body["input"][0]["role"], "user");
+                assert_eq!(body["input"][0]["content"], "hello");
+                assert_eq!(body["tools"][0]["type"], "function");
+                assert_eq!(body["tools"][0]["name"], "web_search");
+                assert_eq!(body["tool_choice"], "auto");
+            }
         }
         assert!(!String::from_utf8_lossy(&request.body).contains(API_KEY_SENTINEL));
     }
@@ -831,6 +864,7 @@ fn assert_failure_response(route: FixtureRoute, result: &AcceptanceResult, statu
         | FixtureRoute::GeminiChat
         | FixtureRoute::GrokChat
         | FixtureRoute::OpenCodeGoChat => "openai_chat",
+        FixtureRoute::OpenaiResponses => "openai_responses",
     };
     assert_eq!(body["error"]["route"], expected_route);
     assert!(body["error"]["provider"].as_str().is_some());
@@ -934,6 +968,9 @@ fn assert_opened_failure(route: FixtureRoute, mode: AttemptMode, opened_fixture:
         OpenedFixture::MalformedJson => {
             UpstreamStep::bytes(200, "OK", "application/json", b"{not-json".to_vec())
         }
+        OpenedFixture::IncompleteBody => {
+            UpstreamStep::PartialSseThenDrop(b"{\"id\":\"resp_partial\"".to_vec())
+        }
         OpenedFixture::PartialSseThenClose => {
             UpstreamStep::PartialSseThenDrop(b"event: message_start\n".to_vec())
         }
@@ -987,6 +1024,35 @@ fn assert_delivery_failure(route: FixtureRoute, mode: AttemptMode, failure: Deli
         }
     }
     assert_one_final_diagnostic(&result, "cancelled");
+}
+
+fn assert_unsupported_tool_choice_is_terminal(
+    route: FixtureRoute,
+    status: u16,
+    expected_posts: usize,
+    expected_delays: usize,
+) {
+    let result = run(
+        route,
+        AttemptMode::Nonstream,
+        vec![UpstreamStep::json(
+            status,
+            "Unsupported Tool Choice",
+            json!({
+                "error": {
+                    "message": "automatic tool_choice is unsupported",
+                    "code": "unsupported_value",
+                    "param": "tool_choice",
+                    "request_id": request_id_sentinel(route),
+                    "host": PRIVATE_HOST_SENTINEL
+                }
+            }),
+        )],
+    );
+    assert_script(route, &result, expected_posts);
+    assert_eq!(result.delays_ms.len(), expected_delays);
+    assert_failure_response(route, &result, status);
+    assert_one_final_diagnostic(&result, "failed");
 }
 
 fn assert_redacted(route: FixtureRoute, sentinels: &[&str]) {
@@ -1047,6 +1113,8 @@ fn expected_success_fixture(fixture_name: &str) -> &'static str {
         "grok-chat" => "{\"id\":\"chatcmpl_grok\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-sonnet-4-20250514\",\"content\":[{\"type\":\"text\",\"text\":\"grok ok\"}],\"stop_reason\":\"end_turn\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":3,\"output_tokens\":4}}",
         "opencode-go-chat" => "{\"id\":\"chatcmpl_opencode_go\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-sonnet-4-20250514\",\"content\":[{\"type\":\"text\",\"text\":\"opencode go ok\"}],\"stop_reason\":\"end_turn\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":3,\"output_tokens\":4}}",
         "openai-chat-local-sse-replay" => "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"chatcmpl_custom\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-sonnet-4-20250514\",\"content\":[],\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{\"input_tokens\":3,\"output_tokens\":4}}}\n\nevent: ping\ndata: {\"type\":\"ping\"}\n\nevent: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"custom ok\"}}\n\nevent: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\nevent: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"usage\":{\"output_tokens\":4}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+        "openai-responses-metadata-map" => "{\"id\":\"resp_ok\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-sonnet-4-20250514\",\"content\":[{\"type\":\"text\",\"text\":\"responses ok\"},{\"type\":\"tool_use\",\"id\":\"call_resp\",\"name\":\"web_search\",\"input\":{\"query\":\"q\"}}],\"stop_reason\":\"tool_use\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":5,\"output_tokens\":6}}",
+        "openai-responses-local-sse-replay" => "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"resp_ok\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-sonnet-4-20250514\",\"content\":[],\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{\"input_tokens\":5,\"output_tokens\":6}}}\n\nevent: ping\ndata: {\"type\":\"ping\"}\n\nevent: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"responses ok\"}}\n\nevent: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\nevent: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"call_resp\",\"name\":\"web_search\",\"input\":{}}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"query\\\": \\\"q\\\"}\"}}\n\nevent: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":1}\n\nevent: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\",\"stop_sequence\":null},\"usage\":{\"output_tokens\":6}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
         other => panic!("unknown success fixture {other}"),
     }
 }
@@ -1061,6 +1129,7 @@ fn expected_upstream_model(route: FixtureRoute) -> &'static str {
         FixtureRoute::GeminiChat => "gemini-2.5-pro",
         FixtureRoute::GrokChat => "grok-4",
         FixtureRoute::OpenCodeGoChat => "opencode-go-chat",
+        FixtureRoute::OpenaiResponses => "openai-responses-model",
     }
 }
 
@@ -1084,6 +1153,32 @@ fn openai_chat_success_body(route: FixtureRoute) -> Value {
             "finish_reason": "stop"
         }],
         "usage": {"prompt_tokens": 3, "completion_tokens": 4, "total_tokens": 7}
+    })
+}
+
+fn openai_responses_success_body() -> Value {
+    json!({
+        "id": "resp_ok",
+        "status": "completed",
+        "output": [
+            {
+                "type": "message",
+                "content": [{
+                    "type": "output_text",
+                    "text": "responses ok"
+                }]
+            },
+            {
+                "type": "function_call",
+                "call_id": "call_resp",
+                "name": "web_search",
+                "arguments": "{\"query\":\"q\"}"
+            }
+        ],
+        "usage": {
+            "input_tokens": 5,
+            "output_tokens": 6
+        }
     })
 }
 
@@ -1119,6 +1214,7 @@ fn success_step(route: FixtureRoute, mode: AttemptMode) -> UpstreamStep {
                 | FixtureRoute::GeminiChat
                 | FixtureRoute::GrokChat
                 | FixtureRoute::OpenCodeGoChat => openai_chat_success_body(route),
+                FixtureRoute::OpenaiResponses => openai_responses_success_body(),
             };
             UpstreamStep::json(200, "OK", body)
         }
@@ -1128,6 +1224,9 @@ fn success_step(route: FixtureRoute, mode: AttemptMode) -> UpstreamStep {
             | FixtureRoute::GeminiChat
             | FixtureRoute::GrokChat
             | FixtureRoute::OpenCodeGoChat => UpstreamStep::json(200, "OK", openai_chat_success_body(route)),
+            FixtureRoute::OpenaiResponses => {
+                UpstreamStep::json(200, "OK", openai_responses_success_body())
+            }
             FixtureRoute::RelayAnthropic | FixtureRoute::RelayKimi | FixtureRoute::DeepseekAnthropic => {
                 UpstreamStep::bytes(
                     200,
@@ -1373,6 +1472,83 @@ fn api_contract_openai_chat_stream_replay_delivery_controls_final_outcome() {
         AttemptMode::Stream,
         DeliveryFailure::FinalFlush,
     );
+}
+
+#[test]
+fn api_contract_openai_responses_retries_conflict_rate_and_5xx_only() {
+    assert_retry_then_success(
+        FixtureRoute::OpenaiResponses,
+        AttemptMode::Nonstream,
+        409,
+        None,
+        500,
+    );
+    assert_retry_then_success(
+        FixtureRoute::OpenaiResponses,
+        AttemptMode::Nonstream,
+        429,
+        Some(90),
+        60_000,
+    );
+    assert_exhausted(
+        FixtureRoute::OpenaiResponses,
+        AttemptMode::Nonstream,
+        502,
+        &[500, 1_000],
+    );
+}
+
+#[test]
+fn api_contract_openai_responses_quota_and_permanent_errors_are_terminal() {
+    for status in [400, 401, 403, 422, 307] {
+        assert_terminal_http(
+            FixtureRoute::OpenaiResponses,
+            AttemptMode::Nonstream,
+            status,
+            ErrorCode::Absent,
+            1,
+        );
+    }
+    assert_terminal_http(
+        FixtureRoute::OpenaiResponses,
+        AttemptMode::Nonstream,
+        429,
+        ErrorCode::InsufficientQuota,
+        1,
+    );
+}
+
+#[test]
+fn api_contract_openai_responses_malformed_or_incomplete_success_never_replays() {
+    assert_opened_failure(
+        FixtureRoute::OpenaiResponses,
+        AttemptMode::Nonstream,
+        OpenedFixture::MalformedJson,
+    );
+    assert_opened_failure(
+        FixtureRoute::OpenaiResponses,
+        AttemptMode::Nonstream,
+        OpenedFixture::IncompleteBody,
+    );
+}
+
+#[test]
+fn api_contract_openai_responses_success_metadata_and_mapping_are_unchanged() {
+    assert_success_fixture(
+        FixtureRoute::OpenaiResponses,
+        AttemptMode::Nonstream,
+        "openai-responses-metadata-map",
+    );
+    assert_success_fixture(
+        FixtureRoute::OpenaiResponses,
+        AttemptMode::Stream,
+        "openai-responses-local-sse-replay",
+    );
+}
+
+#[test]
+fn api_contract_openai_responses_never_authorizes_safe_repair() {
+    assert_unsupported_tool_choice_is_terminal(FixtureRoute::OpenaiResponses, 400, 1, 0);
 }
 
 #[test]

@@ -425,7 +425,11 @@ impl ProviderFailure {
                 "Start a new request after the provider recovers",
             ),
             FailureObservation::Http { status, .. }
-                if (300..=399).contains(status) && context.route == RouteMode::OpenaiChat =>
+                if (300..=399).contains(status)
+                    && matches!(
+                        context.route,
+                        RouteMode::OpenaiChat | RouteMode::OpenaiResponses
+                    ) =>
             {
                 (
                     *status,
