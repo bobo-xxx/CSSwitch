@@ -220,6 +220,36 @@ fn anthropic_and_openai_policies_differ_only_on_conflict() {
 }
 
 #[test]
+fn anthropic_messages_conflict_is_permanent_invalid_request() {
+    let context = api_context(
+        ProviderId::Relay,
+        RouteMode::AnthropicMessages,
+        RetryPolicy::ANTHROPIC_MESSAGES,
+    );
+    let failure = ProviderFailure::from_observation(&context, &http(409, None, None), false);
+    assert_eq!(failure.status(), 409);
+    assert_eq!(failure.failure_class(), FailureClass::InvalidRequest);
+    assert!(!failure.retryable());
+    assert_eq!(
+        failure.anthropic_json(),
+        serde_json::json!({
+            "type": "error",
+            "error": {
+                "type": "invalid_request_error",
+                "message": "Provider rejected the request",
+                "provider": "relay",
+                "route": "anthropic_messages",
+                "failure_class": "invalid_request",
+                "retryable": false,
+                "correlation_id": "api-corr-0001",
+                "recovery": "Correct the request or select a compatible model",
+                "upstream_status": 409
+            }
+        })
+    );
+}
+
+#[test]
 fn api_key_quota_is_terminal_and_repair_is_structurally_disabled() {
     let context = api_context(
         ProviderId::Relay,

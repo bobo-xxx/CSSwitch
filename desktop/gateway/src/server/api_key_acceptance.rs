@@ -622,8 +622,7 @@ fn assert_one_final_diagnostic(result: &AcceptanceResult, expected_outcome: &str
 }
 
 fn assert_failure_response(result: &AcceptanceResult, status: u16) {
-    let expected_status = if status == 409 { 502 } else { status };
-    assert_eq!(result.status(), expected_status);
+    assert_eq!(result.status(), status);
     let body = result.json();
     assert_eq!(body["type"], "error");
     assert_eq!(body["error"]["route"], "anthropic_messages");

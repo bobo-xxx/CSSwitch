@@ -402,9 +402,20 @@ impl ProviderFailure {
                 exhausted,
                 "Start a new request after the provider recovers",
             ),
+            FailureObservation::Http { status: 409, .. }
+                if context.retry_policy.allows(observation) =>
+            {
+                (
+                    502,
+                    "api_error",
+                    "Provider transient failure exhausted retry budget",
+                    FailureClass::Transient,
+                    exhausted,
+                    "Start a new request after the provider recovers",
+                )
+            }
             FailureObservation::Http {
-                status: 409 | 500..=599,
-                ..
+                status: 500..=599, ..
             } => (
                 502,
                 "api_error",
