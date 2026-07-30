@@ -66,7 +66,12 @@ assert_eq "$(sed -n 's/^setsid_bin=//p' <<<"$contract")" "/usr/bin/env" "contrac
     '#!/usr/bin/env bash' \
     'set -euo pipefail' \
     '{' \
-    '  printf "arg=%s\n" "$@"'
+    '  printf "argc=%d\n" "$#"' \
+    '  arg_index=0' \
+    '  for arg_value in "$@"; do' \
+    '    printf "arg[%d]=%q\n" "$arg_index" "$arg_value"' \
+    '    arg_index=$((arg_index + 1))' \
+    '  done'
   printf '  for env_name in'
   printf ' %q' "${GATEWAY_ENV_NAMES[@]}"
   printf '; do\n'
@@ -81,6 +86,8 @@ run_scenario() {
   local scenario_name="$1" expected_port="$2" expected_proxy="$3" expected_no_proxy="$4"
   shift 4
   local state="$FIXTURE/$scenario_name-state" capture="$FIXTURE/$scenario_name.capture"
+  local expected_args=(--provider codex --port "$expected_port")
+  local expected_arg_vector actual_arg_vector
   mkdir -p "$state"
 
   env \
@@ -114,10 +121,19 @@ run_scenario() {
       wait "$pid"
     ' _ "$CONTROLLER" "$fake_gateway" "$state" /usr/bin/env /usr/bin/env
 
-  assert_eq \
-    "$(sed -n 's/^arg=//p' "$capture")" \
-    "$(printf '%s\n' --provider codex --port "$expected_port")" \
-    "$scenario_name exact argument vector"
+  expected_arg_vector="$(
+    printf 'argc=%d\n' "${#expected_args[@]}"
+    for arg_index in "${!expected_args[@]}"; do
+      printf 'arg[%d]=%q\n' "$arg_index" "${expected_args[$arg_index]}"
+    done
+  )"
+  actual_arg_vector="$(
+    sed -n \
+      -e '/^argc=/p' \
+      -e '/^arg\[[0-9][0-9]*\]=/p' \
+      "$capture"
+  )"
+  assert_eq "$actual_arg_vector" "$expected_arg_vector" "$scenario_name exact argument vector"
   for env_name in "${PROXY_ENV_NAMES[@]}"; do
     assert_line "$capture" "$env_name=$expected_proxy" "$scenario_name $env_name proxy"
   done
