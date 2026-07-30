@@ -24,7 +24,7 @@ struct CachePolicy {
     stale_ttl_seconds: u64,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
 struct InferenceRetryConfig {
     max_posts: u8,
@@ -240,6 +240,32 @@ fn parse_catalog() -> Result<ProviderContractCatalog, String> {
     parse_catalog_text(STATIC_PROVIDER_CONTRACTS_JSON)
 }
 
+fn select_adapter_contract<'a>(
+    catalog: &'a ProviderContractCatalog,
+    provider: &str,
+) -> Result<&'a ProviderContract, String> {
+    let mut matches = catalog
+        .contracts
+        .iter()
+        .filter(|contract| contract.adapter == provider);
+    let first = matches.next().ok_or("provider contract is unavailable")?;
+    if matches.any(|other| {
+        other.auth_mode != first.auth_mode
+            || other.auth_scheme != first.auth_scheme
+            || other.api_key_env != first.api_key_env
+            || other.transport != first.transport
+            || other.inference_retry != first.inference_retry
+            || other.endpoint_policy != first.endpoint_policy
+            || other.endpoint_join != first.endpoint_join
+            || other.timeouts.connect_ms != first.timeouts.connect_ms
+            || other.timeouts.total_ms != first.timeouts.total_ms
+            || other.timeouts.read_idle_ms != first.timeouts.read_idle_ms
+    }) {
+        return Err("provider contract identity is required for this adapter".into());
+    }
+    Ok(first)
+}
+
 pub(crate) fn load_runtime_contract(
     provider: &str,
     expected_id: Option<&str>,
@@ -258,27 +284,7 @@ pub(crate) fn load_runtime_contract(
                 .find(|contract| contract.id == id)
                 .ok_or("managed provider contract is unavailable")?
         }
-        (None, None) => {
-            let mut matches = catalog
-                .contracts
-                .iter()
-                .filter(|contract| contract.adapter == provider);
-            let first = matches.next().ok_or("provider contract is unavailable")?;
-            if matches.any(|other| {
-                other.auth_mode != first.auth_mode
-                    || other.auth_scheme != first.auth_scheme
-                    || other.api_key_env != first.api_key_env
-                    || other.transport != first.transport
-                    || other.endpoint_policy != first.endpoint_policy
-                    || other.endpoint_join != first.endpoint_join
-                    || other.timeouts.connect_ms != first.timeouts.connect_ms
-                    || other.timeouts.total_ms != first.timeouts.total_ms
-                    || other.timeouts.read_idle_ms != first.timeouts.read_idle_ms
-            }) {
-                return Err("provider contract identity is required for this adapter".into());
-            }
-            first
-        }
+        (None, None) => select_adapter_contract(&catalog, provider)?,
         _ => return Err("managed provider contract identity is incomplete".into()),
     };
     if contract.adapter != provider {
@@ -482,6 +488,29 @@ mod tests {
             });
         });
         assert!(parse_catalog_text(&codex_attachment).is_err());
+    }
+
+    #[test]
+    fn adapter_only_lookup_requires_identity_when_retry_policies_differ() {
+        let mut catalog = parse_catalog().unwrap();
+        let mut alternate = catalog
+            .contracts
+            .iter()
+            .find(|contract| contract.adapter == "deepseek")
+            .unwrap()
+            .clone();
+        alternate.id = "deepseek-policy-alternate".into();
+        alternate
+            .inference_retry
+            .as_mut()
+            .unwrap()
+            .retry_after_cap_seconds = 30;
+        catalog.contracts.push(alternate);
+
+        assert_eq!(
+            select_adapter_contract(&catalog, "deepseek").unwrap_err(),
+            "provider contract identity is required for this adapter"
+        );
     }
 
     #[test]
