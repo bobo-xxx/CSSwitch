@@ -4,7 +4,7 @@ Date: 2026-07-30
 
 ## Scope and evidence boundary
 
-Ticket 07 extends the shared Provider Failure Contract to the existing API-key Anthropic Messages, OpenAI Chat, and OpenAI Responses routes. This evidence binds the deterministic implementation to revision `7842d31d71c2334c67db6fe5ee37c5ce762a2a05` and records only fresh offline source/unit and real-handler loopback-fixture verification performed from that revision.
+Ticket 07 extends the shared Provider Failure Contract to the existing API-key Anthropic Messages, OpenAI Chat, and OpenAI Responses routes. This evidence binds the deterministic implementation to revision `2b5dcb804e9d18079309db1d5974b626d39123f6` and records only fresh offline source/unit and real-handler loopback-fixture verification performed from that revision.
 
 This run did not use a live API key, live provider, external endpoint, installed profile, installed runtime, proxy, or service. It did not install, replace, stop, restart, or reconfigure the Gateway, Claude Science, sandbox, or proxy. Fixtures used ephemeral loopback listeners and explicitly rejected reserved runtime ports `2999`, `8765`, `9002`, `9003`, `11434`, and `11535`.
 
@@ -18,7 +18,7 @@ $ git status --short
 exit 0
 
 $ git rev-parse HEAD
-7842d31d71c2334c67db6fe5ee37c5ce762a2a05
+2b5dcb804e9d18079309db1d5974b626d39123f6
 exit 0
 
 $ rustc --version
@@ -66,33 +66,33 @@ Focused policy, domain, transport, runner, and API-key acceptance gates:
 
 ```text
 $ cargo test --offline --manifest-path desktop/gateway/Cargo.toml provider_contracts::tests -- --test-threads=1
-lib: 6 passed; 0 failed; 0 ignored; 0 measured; 325 filtered out
-main: 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
-codex_auth_cli: 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out
+lib: 6 passed; 0 failed; 0 ignored; 0 measured; 325 filtered out; finished in 0.02s
+main: 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+codex_auth_cli: 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
 exit 0
 
 $ cargo test --offline --manifest-path desktop/gateway/Cargo.toml provider_failure::tests -- --test-threads=1
-lib: 19 passed; 0 failed; 0 ignored; 0 measured; 312 filtered out
-main: 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
-codex_auth_cli: 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out
+lib: 19 passed; 0 failed; 0 ignored; 0 measured; 312 filtered out; finished in 0.00s
+main: 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+codex_auth_cli: 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
 exit 0
 
 $ cargo test --offline --manifest-path desktop/gateway/Cargo.toml messages::tests -- --test-threads=1
-lib: 13 passed; 0 failed; 0 ignored; 0 measured; 318 filtered out
-main: 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
-codex_auth_cli: 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out
+lib: 13 passed; 0 failed; 0 ignored; 0 measured; 318 filtered out; finished in 11.82s
+main: 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+codex_auth_cli: 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
 exit 0
 
 $ cargo test --offline --manifest-path desktop/gateway/Cargo.toml api_key_attempt::tests -- --test-threads=1
-lib: 5 passed; 0 failed; 0 ignored; 0 measured; 326 filtered out
-main: 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
-codex_auth_cli: 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out
+lib: 5 passed; 0 failed; 0 ignored; 0 measured; 326 filtered out; finished in 0.00s
+main: 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+codex_auth_cli: 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
 exit 0
 
 $ cargo test --offline --manifest-path desktop/gateway/Cargo.toml --features acceptance-build 'server::api_key_acceptance::api_' -- --nocapture --test-threads=1
-lib: 22 passed; 0 failed; 0 ignored; 0 measured; 369 filtered out
-main: 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
-codex_auth_cli: 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out
+lib: 22 passed; 0 failed; 0 ignored; 0 measured; 369 filtered out; finished in 1.22s
+main: 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+codex_auth_cli: 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
 exit 0
 ```
 
@@ -100,33 +100,33 @@ Codex invariants and protocol compatibility:
 
 ```text
 $ cargo test --offline --manifest-path desktop/gateway/Cargo.toml --features acceptance-build 'server::codex_acceptance::harness_' -- --test-threads=1
-lib: 8 passed; 0 failed; 0 ignored; 0 measured; 383 filtered out
-main: 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
-codex_auth_cli: 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out
+lib: 8 passed; 0 failed; 0 ignored; 0 measured; 383 filtered out; finished in 0.11s
+main: 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+codex_auth_cli: 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
 exit 0
 
 $ cargo test --offline --manifest-path desktop/gateway/Cargo.toml --features acceptance-build 'server::codex_acceptance::contract_' -- --test-threads=1
-lib: 27 passed; 0 failed; 0 ignored; 0 measured; 364 filtered out
-main: 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
-codex_auth_cli: 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out
+lib: 27 passed; 0 failed; 0 ignored; 0 measured; 364 filtered out; finished in 0.78s
+main: 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+codex_auth_cli: 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
 exit 0
 
 $ cargo test --offline --manifest-path desktop/gateway/Cargo.toml anthropic_compat::tests -- --test-threads=1
-lib: 15 passed; 0 failed; 0 ignored; 0 measured; 316 filtered out
-main: 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
-codex_auth_cli: 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out
+lib: 15 passed; 0 failed; 0 ignored; 0 measured; 316 filtered out; finished in 2.67s
+main: 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+codex_auth_cli: 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
 exit 0
 
 $ cargo test --offline --manifest-path desktop/gateway/Cargo.toml openai_chat::tests -- --test-threads=1
-lib: 11 passed; 0 failed; 0 ignored; 0 measured; 320 filtered out
-main: 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
-codex_auth_cli: 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out
+lib: 11 passed; 0 failed; 0 ignored; 0 measured; 320 filtered out; finished in 0.01s
+main: 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+codex_auth_cli: 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
 exit 0
 
 $ cargo test --offline --manifest-path desktop/gateway/Cargo.toml openai_responses::tests -- --test-threads=1
-lib: 6 passed; 0 failed; 0 ignored; 0 measured; 325 filtered out
-main: 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
-codex_auth_cli: 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out
+lib: 6 passed; 0 failed; 0 ignored; 0 measured; 325 filtered out; finished in 0.01s
+main: 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+codex_auth_cli: 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
 exit 0
 ```
 
@@ -134,14 +134,14 @@ Complete offline tests and lint:
 
 ```text
 $ cargo test --offline --manifest-path desktop/gateway/Cargo.toml --all-features -- --test-threads=1
-lib: 391 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
-main: 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
-codex_auth_cli: 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
-doc tests: 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+lib: 391 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 27.73s
+main: 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+codex_auth_cli: 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+doc tests: 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
 exit 0
 
 $ cargo clippy --offline --manifest-path desktop/gateway/Cargo.toml --all-targets --all-features -- -D warnings
-Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.13s
+Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.15s
 exit 0; no warnings
 ```
 
@@ -163,12 +163,23 @@ The acceptance harness requires every captured request to be `POST` to the route
 
 Anthropic `400`, `401`, `403`, `409`, `422`, and exact quota `429` cases assert one POST and no delay. OpenAI Chat and OpenAI Responses `400`, `401`, `403`, `422`, `307`, and exact quota `429` cases assert one POST and no delay. Existing literal success fixtures remain unchanged for Kimi non-stream/stream filtering, DeepSeek DSML non-stream/stream rewriting, Qwen, custom OpenAI Chat, Gemini, Grok, OpenCode Go, OpenAI Chat local SSE replay, and OpenAI Responses metadata mapping/local SSE replay.
 
+## Real-handler network exhaustion
+
+The acceptance suite additionally drives `handle_messages`, the production API-key attempt runner, and the real `messages::post_once`/reqwest classification path for Relay Anthropic, OpenAI custom Chat, and OpenAI Responses. Each route runs both pre-response connect-refused and timeout exhaustion, for six real-handler cases total.
+
+| Failure fixture | Per-route transport evidence | Exact caller and diagnostic result |
+|---|---|---|
+| Connect refused | The runner targets a freshly allocated, released, non-reserved loopback address; the final diagnostic proves three production POST invocations and recorded delays are `[500, 1000]` | Caller status `502`; one `failed` diagnostic; `posts: 3`; `repairs: 0`; reason exactly `{"kind":"failed","delay_count":2,"mapped_status":502,"failure_class":"network","retryable":true}` |
+| Timeout | A loopback listener captures exactly three real POSTs and deliberately never opens a response; each request uses the exact route path and POSTs two/three are byte-identical to POST one; recorded delays are `[500, 1000]` | Caller status `504`; one `failed` diagnostic; `posts: 3`; `repairs: 0`; reason exactly `{"kind":"failed","delay_count":2,"mapped_status":504,"failure_class":"network","retryable":true}` |
+
+Both failure kinds assert that no `completed` or `cancelled` outcome is emitted, no repair occurs, and the API-key, upstream-text, and private-host sentinels are absent from both caller output and serialized diagnostics. Timeout fixtures override only cloned managed-contract connect/total/read-idle bounds to 20 ms; retry waits remain the recording seam and do not sleep. All address allocation retains the reserved-port rejection.
+
 ## Response-open and cancellation barriers
 
 - The runner accepts retry observations only before a successful response opens. Malformed JSON after 2xx, incomplete body, and partial SSE fixtures each assert exactly one POST, no delay, no replay, and one final `failed` diagnostic.
 - Downstream final-body and final-flush failures are exercised across Relay Anthropic, Qwen Chat, and OpenAI Responses. OpenAI Chat also exercises content-chunk, terminal-chunk, and final-flush failures. Each asserts exactly one final `cancelled` diagnostic and explicitly excludes `failed` and `completed` outcomes.
 - Retry-wait cancellation is exercised on all three route families. Each fixture records delay vector `[500]`, makes one POST, leaves the scripted success step unconsumed, and emits exactly one `cancelled` diagnostic before a second POST.
-- Successful opened responses finalize only after checked downstream delivery. The acceptance suite verifies the same finalizer is used by multiple production branches; it does not use a separate acceptance-only delivery path.
+- Successful opened responses finalize only after checked downstream delivery. Behavioral delivery fault injection runs through the real handler's checked production delivery helpers and asserts final outcomes without relying on a source-text shape guard.
 
 ## Closed caller and diagnostic schemas
 
@@ -188,5 +199,4 @@ Cross-route fixtures inject the sentinels `fixture-api-key`, `secret upstream te
 
 - This is deterministic Linux-headless evidence, not live-provider or installed-runtime evidence. No transient failure, quota, authentication rejection, disconnect, or repair condition was induced against a real provider.
 - No macOS runtime was available. Shared Rust compilation/tests cover source compatibility, but real macOS runtime execution remains pending.
-- One acceptance regression uses an `include_str!` source-shape guard to prevent reintroducing a test-only delivery bypass and dead finalizer. It passed here, but remains a brittle Minor review concern rather than runtime behavioral proof; the real-handler delivery/cancellation fixtures provide the behavioral evidence.
 - Publication and independent whole-branch review are controller-owned follow-up work. This evidence task does not push or deploy the branch.
